@@ -1,5 +1,5 @@
 import type { FilterNode, OpFilter } from "../ast.ts";
-import { PgbError } from "../errors.ts";
+import { PgbaseError } from "../errors.ts";
 import { splitTopLevel, stripParens, unquote } from "./util.ts";
 
 export const SCALAR_OPS = new Set([
@@ -58,7 +58,7 @@ export function parseCondition(raw: string): FilterNode {
   }
 
   const match = CONDITION_RE.exec(s);
-  if (!match) throw PgbError.parse(`failed to parse filter (${raw})`, raw);
+  if (!match) throw PgbaseError.parse(`failed to parse filter (${raw})`, raw);
 
   let column = match[1]!.trim();
   const negate = match[2] === "not";
@@ -76,7 +76,7 @@ export function parseCondition(raw: string): FilterNode {
   }
 
   if (!SCALAR_OPS.has(op) && op !== IN_OP && !ARRAY_OPS.has(op) && !FTS_OPS.has(op)) {
-    throw PgbError.parse(`unknown operator: ${op}`, raw);
+    throw PgbaseError.parse(`unknown operator: ${op}`, raw);
   }
 
   return {
@@ -96,7 +96,7 @@ function parseValue(op: string, raw: string): unknown {
   if (op === "is") {
     const v = value.toLowerCase();
     if (v === "null" || v === "unknown" || v === "true" || v === "false") return v;
-    throw PgbError.parse(`unexpected 'is' value: ${value}`);
+    throw PgbaseError.parse(`unexpected 'is' value: ${value}`);
   }
 
   if (op === "in") {

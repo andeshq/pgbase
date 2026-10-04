@@ -1,14 +1,14 @@
 import { sql, type RawBuilder } from "kysely";
 import type { FilterNode, OpFilter } from "../ast.ts";
-import { PgbError } from "../errors.ts";
+import { PgbaseError } from "../errors.ts";
 import { ARRAY_OPS, FTS_OPS, IN_OP } from "../parse/filter.ts";
 import { isValidCast } from "../parse/util.ts";
-import type { PgbRelation } from "../types.ts";
+import type { PgbaseRelation } from "../types.ts";
 
 /** A table (or derived table) being queried, qualified with its alias. */
 export interface QueryLevel {
   name: string;
-  relation: PgbRelation;
+  relation: PgbaseRelation;
   path: string;
 }
 
@@ -43,8 +43,8 @@ const FTS_FUNCTIONS: Record<string, string> = {
   wfts: "websearch_to_tsquery",
 };
 
-export function assertColumn(relation: PgbRelation, column: string): void {
-  if (!relation.columnMap.has(column)) throw PgbError.columnNotFound(column, relation.name);
+export function assertColumn(relation: PgbaseRelation, column: string): void {
+  if (!relation.columnMap.has(column)) throw PgbaseError.columnNotFound(column, relation.name);
 }
 
 /** Render a column reference, including optional `->` JSON path and `::cast`. */
@@ -63,7 +63,7 @@ export function renderColumn(
     expr = sql`${expr}->>${jsonPath.at(-1)}`;
   }
   if (cast) {
-    if (!isValidCast(cast)) throw PgbError.parse(`invalid cast: ::${cast}`);
+    if (!isValidCast(cast)) throw PgbaseError.parse(`invalid cast: ::${cast}`);
     expr = sql`${expr}::${sql.raw(cast)}`;
   }
   return expr;
@@ -121,7 +121,7 @@ function renderOpFilter(filter: OpFilter, level: QueryLevel): RawBuilder<any> {
   }
 
   const symbol = SCALAR_SYMBOLS[filter.op];
-  if (!symbol) throw PgbError.parse(`unsupported operator: ${filter.op}`);
+  if (!symbol) throw PgbaseError.parse(`unsupported operator: ${filter.op}`);
   const expr = sql`${lhs} ${sql.raw(symbol)} ${filter.value}`;
   return filter.negate ? sql`not (${expr})` : expr;
 }

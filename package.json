@@ -1,5 +1,5 @@
 {
-  "name": "pgb",
+  "name": "pgbase",
   "version": "0.1.0",
   "description": "Composable, configurable PostgREST-compatible API for Kysely, on Node",
   "type": "module",
@@ -15,7 +15,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/andeshq/pgb.git"
+    "url": "git+https://github.com/andeshq/pgbase.git"
   },
   "scripts": {
     "test": "node --test 'test/**/*.test.ts'",

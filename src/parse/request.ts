@@ -1,4 +1,4 @@
-import type { EmbedParams, FilterNode, OrderTerm, ParsedMutation, ParsedRequest, ParsedRpc, PreferOptions, SelectNode, WriteMethod } from "../ast.ts";import { PgbError } from "../errors.ts";
+import type { EmbedParams, FilterNode, OrderTerm, ParsedMutation, ParsedRequest, ParsedRpc, PreferOptions, SelectNode, WriteMethod } from "../ast.ts";import { PgbaseError } from "../errors.ts";
 import { parseCondition, parseLogicParam } from "./filter.ts";
 import { parseSelect } from "./select.ts";
 import { splitTopLevel, unquote } from "./util.ts";
@@ -39,7 +39,7 @@ function parseOrderTerm(raw: string): OrderTerm {
     column = unquote(column);
   }
 
-  if (!column) throw PgbError.parse(`failed to parse order term: ${raw}`);
+  if (!column) throw PgbaseError.parse(`failed to parse order term: ${raw}`);
   return { column, direction, nulls, jsonPath, cast };
 }
 
@@ -64,7 +64,7 @@ function routeEmbedKey(key: string, paths: Set<string>): { path: string; rest: s
 }
 
 function parseSize(value: string, name: string): number {
-  if (!/^\d+$/.test(value.trim())) throw PgbError.parse(`invalid ${name}: ${value}`);
+  if (!/^\d+$/.test(value.trim())) throw PgbaseError.parse(`invalid ${name}: ${value}`);
   return Number(value);
 }
 
@@ -81,10 +81,10 @@ interface RangeHeader {
 function parseRangeHeader(header: string | null): RangeHeader | null {
   if (!header) return null;
   const match = /^(\d+)-(\d*)$/.exec(header.trim());
-  if (!match) throw PgbError.invalidRange(`invalid range: ${header}`);
+  if (!match) throw PgbaseError.invalidRange(`invalid range: ${header}`);
   const offset = Number(match[1]);
   const end = match[2] ? Number(match[2]) : null;
-  if (end !== null && end < offset) throw PgbError.invalidRange(`invalid range: ${header}`);
+  if (end !== null && end < offset) throw PgbaseError.invalidRange(`invalid range: ${header}`);
   return { offset, limit: end !== null ? end - offset + 1 : null };
 }
 

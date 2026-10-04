@@ -1,5 +1,5 @@
 import { type Kysely } from "kysely";
-import { PgbError } from "./errors.ts";
+import { PgbaseError } from "./errors.ts";
 import { parseMutation, parseRequest, parseRpc } from "./parse/request.ts";
 import { executeRead, type BaseContext } from "./query/compile.ts";
 import { executeMutation } from "./query/write.ts";
@@ -9,10 +9,10 @@ import { introspect } from "./schema/index.ts";
 import { applySession } from "./session.ts";
 import { startSchemaListener, type NotifyListener } from "./schema-listener.ts";
 import { normalizeBasePath, matchBasePath, firstSchema, isWriteMethod } from "./routing.ts";
-import type { Pgb, PgbConfig, PgbContext, PgbSchema, PgbSession } from "./types.ts";
+import type { Pgbase, PgbaseConfig, PgbaseContext, PgbaseSchema, PgbaseSession } from "./types.ts";
 import type { WriteMethod } from "./ast.ts";
 
-function rootResponse(schema: PgbSchema): Response {
+function rootResponse(schema: PgbaseSchema): Response {
   return Response.json({
     schema: schema.schema,
     tables: schema.relations.map((relation) => relation.name),
@@ -21,7 +21,7 @@ function rootResponse(schema: PgbSchema): Response {
 
 /** Shared dependencies resolved once from the config. */
 interface Runtime {
-  config: PgbConfig<any>;
+  config: PgbaseConfig<any>;
   schemaName: string;
   searchPath: string[];
   maxRows: number;
@@ -36,8 +36,8 @@ interface Runtime {
 async function resolveSession(
   runtime: Runtime,
   request: Request,
-  ctx: PgbContext,
-): Promise<PgbSession | null> {
+  ctx: PgbaseContext,
+): Promise<PgbaseSession | null> {
   const claims = runtime.config.getSession ? await runtime.config.getSession(request) : null;
   ctx.role = claims?.role ?? (claims === null ? (runtime.config.anonRole ?? null) : null);
   ctx.claims = claims;
@@ -54,9 +54,9 @@ async function withSession<T>(
   runtime: Runtime,
   trx: any,
   request: Request,
-  ctx: PgbContext,
+  ctx: PgbaseContext,
   path: string,
-  session: PgbSession | null,
+  session: PgbaseSession | null,
   operation: (base: BaseContext) => Promise<T>,
 ): Promise<T> {
   await applySession(
@@ -83,7 +83,7 @@ function assertBodySize(request: Request, limit: number): void {
   const header = request.headers.get("content-length");
   if (header !== null) {
     const length = Number(header);
-    if (Number.isFinite(length) && length > limit) throw PgbError.bodyTooLarge(limit);
+    if (Number.isFinite(length) && length > limit) throw PgbaseError.bodyTooLarge(limit);
   }
 }
 
@@ -91,7 +91,7 @@ function assertBodySize(request: Request, limit: number): void {
 async function readBodyText(request: Request, limit: number): Promise<string> {
   assertBodySize(request, limit);
   const text = await request.clone().text();
-  if (text.length > limit) throw PgbError.bodyTooLarge(limit);
+  if (text.length > limit) throw PgbaseError.bodyTooLarge(limit);
   return text;
 }
 
@@ -99,14 +99,14 @@ async function readBodyText(request: Request, limit: number): Promise<string> {
  * Create a composable, PostgREST-compatible API handler.
  *
  * ```ts
- * const pgb = createPgb({ database, getSession: () => ({ role: "authenticated" }) });
+ * const pgb = createPgbase({ database, getSession: () => ({ role: "authenticated" }) });
  * http.createServer((req, res) => void pgb.handler(toWebRequest(req)).then(...));
  * // or any web-standard runtime: Bun.serve, Deno.serve, Hono, Elysia, Next.
  * ```
  */
-export function createPgb<DB = unknown>(config: PgbConfig<DB>): Pgb<DB> {
+export function createPgbase<DB = unknown>(config: PgbaseConfig<DB>): Pgbase<DB> {
   if (!config || !config.database) {
-    throw new Error("pgb: `config.database` (a Kysely instance) is required");
+    throw new Error("pgbase: `config.database` (a Kysely instance) is required");
   }
 
   const schemaName = firstSchema(config.schemaName);
@@ -115,13 +115,13 @@ export function createPgb<DB = unknown>(config: PgbConfig<DB>): Pgb<DB> {
   // an owner. Require an explicit acknowledgement in that case.
   if (!config.getSession && !config.anonRole && !config.allowConnectionRole) {
     console.warn(
-      "[pgb] no `getSession` or `anonRole` configured: requests run with the " +
+      "[pgbase] no `getSession` or `anonRole` configured: requests run with the " +
         "connection's role. Set `anonRole` or `allowConnectionRole: true` to silence this.",
     );
   }
 
   const runtime: Runtime = {
-    config: config as PgbConfig<any>,
+    config: config as PgbaseConfig<any>,
     schemaName,
     searchPath: [schemaName, ...(config.extraSearchPath ?? ["public"])],
     maxRows: config.maxRows ?? Infinity,
@@ -132,8 +132,8 @@ export function createPgb<DB = unknown>(config: PgbConfig<DB>): Pgb<DB> {
     verbosity: config.errorVerbosity ?? "verbose",
   };
 
-  let schemaPromise: Promise<PgbSchema> | null = null;
-  const loadSchema = (): Promise<PgbSchema> => {
+  let schemaPromise: Promise<PgbaseSchema> | null = null;
+  const loadSchema = (): Promise<PgbaseSchema> => {
     if (!schemaPromise) {
       schemaPromise = introspect(config.database, schemaName, config.exposed);
     }
@@ -146,7 +146,7 @@ export function createPgb<DB = unknown>(config: PgbConfig<DB>): Pgb<DB> {
     listenerPromise = (async () => {
       if (!config.refreshOnNotify) return null;
       if (!config.createListenClient) {
-        console.warn("[pgb] `refreshOnNotify` requires `createListenClient`; listener disabled");
+        console.warn("[pgbase] `refreshOnNotify` requires `createListenClient`; listener disabled");
         return null;
       }
       const client = await config.createListenClient();
@@ -156,7 +156,7 @@ export function createPgb<DB = unknown>(config: PgbConfig<DB>): Pgb<DB> {
           schemaPromise = null;
           void loadSchema();
         },
-        onError: (error) => console.warn("[pgb] schema listener error", error),
+        onError: (error) => console.warn("[pgbase] schema listener error", error),
       });
     })();
     return listenerPromise;
@@ -170,16 +170,16 @@ export function createPgb<DB = unknown>(config: PgbConfig<DB>): Pgb<DB> {
       if (hook) return hook;
 
       const rest = matchBasePath(url.pathname, runtime.basePath);
-      if (rest === null) return errorResponse(new PgbError("PGRST404", "Not Found", 404));
+      if (rest === null) return errorResponse(new PgbaseError("PGRST404", "Not Found", 404));
 
       const schema = await loadSchema();
-      const ctx: PgbContext = { schema, schemaName, url };
+      const ctx: PgbaseContext = { schema, schemaName, url };
 
       if (rest === "") return rootResponse(schema);
 
       const profile = request.headers.get("accept-profile");
       if (profile && profile !== "*" && profile !== schemaName) {
-        return errorResponse(PgbError.schemaNotExposed(profile, schemaName));
+        return errorResponse(PgbaseError.schemaNotExposed(profile, schemaName));
       }
 
       const method = request.method.toUpperCase();
@@ -194,7 +194,7 @@ export function createPgb<DB = unknown>(config: PgbConfig<DB>): Pgb<DB> {
       }
 
       const table = decodeURIComponent(rest);
-      if (!schema.tables.has(table)) return errorResponse(PgbError.tableNotFound(table));
+      if (!schema.tables.has(table)) return errorResponse(PgbaseError.tableNotFound(table));
       ctx.table = table;
 
       const result = isWriteMethod(method)
@@ -202,11 +202,11 @@ export function createPgb<DB = unknown>(config: PgbConfig<DB>): Pgb<DB> {
         : await runRead(runtime, request, ctx, rest, table, method, session);
 
       if (config.debug) {
-        console.debug(`[pgb] ${method} ${url.pathname}${url.search} -> ${result.rows} rows`);
+        console.debug(`[pgbase] ${method} ${url.pathname}${url.search} -> ${result.rows} rows`);
       }
       return result.response;
     } catch (error) {
-      if (config.debug) console.debug("[pgb] error", error);
+      if (config.debug) console.debug("[pgbase] error", error);
       if (config.onError) {
         const custom = await config.onError(error);
         if (custom) return custom;
@@ -238,14 +238,14 @@ export function createPgb<DB = unknown>(config: PgbConfig<DB>): Pgb<DB> {
 async function runRead(
   runtime: Runtime,
   request: Request,
-  ctx: PgbContext,
+  ctx: PgbaseContext,
   path: string,
   table: string,
   method: string,
-  session: PgbSession | null,
+  session: PgbaseSession | null,
 ): Promise<{ response: Response; rows: number }> {
   if (method !== "GET" && method !== "HEAD") {
-    return { response: errorResponse(PgbError.methodNotAllowed(request.method)), rows: 0 };
+    return { response: errorResponse(PgbaseError.methodNotAllowed(request.method)), rows: 0 };
   }
 
   const parsed = parseRequest(request, runtime.schemaName, table);
@@ -260,11 +260,11 @@ async function runRead(
 async function runWrite(
   runtime: Runtime,
   request: Request,
-  ctx: PgbContext,
+  ctx: PgbaseContext,
   path: string,
   table: string,
   method: WriteMethod,
-  session: PgbSession | null,
+  session: PgbaseSession | null,
 ): Promise<{ response: Response; rows: number }> {
   assertBodySize(request, runtime.maxBodyBytes);
   const mutation = parseMutation(request, runtime.schemaName, table, method);
@@ -284,27 +284,27 @@ async function handleRpc(
   nameArg: string,
   method: string,
   request: Request,
-  ctx: PgbContext,
-  session: PgbSession | null,
+  ctx: PgbaseContext,
+  session: PgbaseSession | null,
 ): Promise<Response> {
   const schema = ctx.schema;
   const parsed = parseRpc(request, runtime.schemaName, nameArg);
   ctx.table = parsed.fn;
 
   const fn = schema.functions.get(parsed.fn);
-  if (!fn) return errorResponse(PgbError.functionNotFound(parsed.fn));
+  if (!fn) return errorResponse(PgbaseError.functionNotFound(parsed.fn));
   parsed.readOnly = fn.volatility !== "v";
 
   if (method === "GET" || method === "HEAD") {
     if (!parsed.readOnly) {
       return errorResponse(
-        new PgbError("PGRST102", "Only read-only functions can be called with GET", 405, null, null, {
+        new PgbaseError("PGRST102", "Only read-only functions can be called with GET", 405, null, null, {
           Allow: "POST",
         }),
       );
     }
   } else if (method !== "POST") {
-    return errorResponse(PgbError.methodNotAllowed(request.method));
+    return errorResponse(PgbaseError.methodNotAllowed(request.method));
   }
 
   // Parse the body up front so `params=bulk` knows how many invocations to run.
@@ -315,7 +315,7 @@ async function handleRpc(
       try {
         body = JSON.parse(text);
       } catch {
-        return errorResponse(PgbError.parse("Failed to parse the request body as JSON"));
+        return errorResponse(PgbaseError.parse("Failed to parse the request body as JSON"));
       }
     }
   }

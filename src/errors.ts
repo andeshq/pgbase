@@ -5,7 +5,7 @@
  * { "code": "PGRST100", "details": "...", "hint": "...", "message": "..." }
  * ```
  */
-export class PgbError extends Error {
+export class PgbaseError extends Error {
   readonly code: string;
   readonly status: number;
   readonly details: string | null;
@@ -21,7 +21,7 @@ export class PgbError extends Error {
     headers?: Record<string, string>,
   ) {
     super(message);
-    this.name = "PgbError";
+    this.name = "PgbaseError";
     this.code = code;
     this.status = status;
     this.details = details;
@@ -39,15 +39,15 @@ export class PgbError extends Error {
   }
 
   static parse(message: string, details: string | null = null) {
-    return new PgbError("PGRST100", message, 400, details);
+    return new PgbaseError("PGRST100", message, 400, details);
   }
 
   static invalidRange(details: string) {
-    return new PgbError("PGRST103", "Requested range not satisfiable", 416, details);
+    return new PgbaseError("PGRST103", "Requested range not satisfiable", 416, details);
   }
 
   static schemaNotExposed(schema: string, allowed: string) {
-    return new PgbError(
+    return new PgbaseError(
       "PGRST106",
       `The schema must be one of the following: ${allowed}`,
       406,
@@ -56,7 +56,7 @@ export class PgbError extends Error {
   }
 
   static columnNotFound(column: string, table: string) {
-    return new PgbError(
+    return new PgbaseError(
       "PGRST204",
       `Could not find the '${column}' column of '${table}' in the schema cache`,
       400,
@@ -64,7 +64,7 @@ export class PgbError extends Error {
   }
 
   static tableNotFound(table: string) {
-    return new PgbError(
+    return new PgbaseError(
       "PGRST205",
       `Could not find the table '${table}' in the schema cache`,
       404,
@@ -72,7 +72,7 @@ export class PgbError extends Error {
   }
 
   static relationshipNotFound(from: string, to: string) {
-    return new PgbError(
+    return new PgbaseError(
       "PGRST200",
       `Could not find a relationship between '${from}' and '${to}' in the schema cache`,
       400,
@@ -80,7 +80,7 @@ export class PgbError extends Error {
   }
 
   static ambiguousEmbedding(from: string, to: string, hints: string[]) {
-    return new PgbError(
+    return new PgbaseError(
       "PGRST201",
       `Could not embed because more than one relationship was found for '${from}' and '${to}'`,
       300,
@@ -90,7 +90,7 @@ export class PgbError extends Error {
   }
 
   static notSingular(count: number) {
-    return new PgbError(
+    return new PgbaseError(
       "PGRST116",
       "JSON object requested, multiple (or no) rows returned",
       406,
@@ -99,17 +99,17 @@ export class PgbError extends Error {
   }
 
   static methodNotAllowed(method: string) {
-    return new PgbError("PGRST405", `Method not allowed: ${method}`, 405, null, null, {
+    return new PgbaseError("PGRST405", `Method not allowed: ${method}`, 405, null, null, {
       Allow: "GET, HEAD, POST, PATCH, PUT, DELETE",
     });
   }
 
   static relationshipEmpty(message = "Cannot embed a relationship: no rows to relate to") {
-    return new PgbError("PGRST124", message, 400);
+    return new PgbaseError("PGRST124", message, 400);
   }
 
   static functionNotFound(fn: string, hint?: string) {
-    return new PgbError(
+    return new PgbaseError(
       "PGRST202",
       `Could not find the function public.${fn} with the specified parameters in the schema cache`,
       404,
@@ -119,12 +119,12 @@ export class PgbError extends Error {
   }
 
   static notImplemented(message: string) {
-    return new PgbError("PGRST117", message, 501);
+    return new PgbaseError("PGRST117", message, 501);
   }
 
   /** POST/PATCH/PUT body exceeded `maxBodyBytes`. */
   static bodyTooLarge(limit: number) {
-    return new PgbError(
+    return new PgbaseError(
       "PGRST113",
       `Request body exceeds the maximum allowed size of ${limit} bytes`,
       413,
@@ -137,7 +137,7 @@ export class PgbError extends Error {
  * `set`/`values` so `Prefer: missing=default` maps an omitted column to
  * `default` instead of `null`.
  */
-export const DEFAULT = Symbol.for("pgb.DEFAULT");
+export const DEFAULT = Symbol.for("pgbase.DEFAULT");
 
 /** Postgres SQLSTATE -> HTTP status. */
 const PG_STATUS: Record<string, number> = {
@@ -176,8 +176,8 @@ function statusForPgCode(code: string): number {
  * Convert any thrown value into a PostgREST-shaped error. `verbosity` controls
  * whether `details`/`hint` are preserved ("verbose") or dropped ("minimal").
  */
-export function fromPostgresError(error: unknown, verbosity: "verbose" | "minimal" = "verbose"): PgbError {
-  if (error instanceof PgbError) return error;
+export function fromPostgresError(error: unknown, verbosity: "verbose" | "minimal" = "verbose"): PgbaseError {
+  if (error instanceof PgbaseError) return error;
 
   // A thrown error carrying a numeric HTTP status (e.g. a framework's
   // `HTTPException`) is honoured as-is, so hosts can throw their own 401s.
@@ -190,7 +190,7 @@ export function fromPostgresError(error: unknown, verbosity: "verbose" | "minima
           ? ((error as { message: string }).message)
           : "Error";
     const code = pgbCodeForStatus(status);
-    return new PgbError(code, message, status);
+    return new PgbaseError(code, message, status);
   }
 
   const err = error as {
@@ -204,12 +204,12 @@ export function fromPostgresError(error: unknown, verbosity: "verbose" | "minima
   const exposeDetail = verbosity === "verbose";
   const details = exposeDetail && typeof err?.detail === "string" ? err.detail : null;
   const hint = exposeDetail && typeof err?.hint === "string" ? err.hint : null;
-  if (!code) return new PgbError("PGRST500", message, 500, details, hint);
+  if (!code) return new PgbaseError("PGRST500", message, 500, details, hint);
   // 42501 covers both "permission denied" and RLS `with check` violations.
   if (code === "42501" && /row-level security/i.test(message)) {
-    return new PgbError(code, message, 403, details, hint);
+    return new PgbaseError(code, message, 403, details, hint);
   }
-  return new PgbError(code, message, statusForPgCode(code), details, hint);
+  return new PgbaseError(code, message, statusForPgCode(code), details, hint);
 }
 
 /** Read a numeric HTTP status from a thrown error, if it carries one. */

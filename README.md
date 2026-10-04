@@ -1,15 +1,15 @@
-# pgb
+# pgbase
 
 A composable, [PostgREST](https://postgrest.org)-compatible API for [Kysely](https://kysely.dev) — built for Node.
 
-Like Better Auth's `auth.handler`, `pgb` gives you a web-standard `(Request) => Response` handler that you can attach to any router. You bring your own Kysely instance, your own auth, and your own database; `pgb` turns it into a PostgREST-style REST API with per-request `SET LOCAL ROLE` and claim GUCs so Postgres RLS does the authorization.
+Like Better Auth's `auth.handler`, `pgbase` gives you a web-standard `(Request) => Response` handler that you can attach to any router. You bring your own Kysely instance, your own auth, and your own database; `pgbase` turns it into a PostgREST-style REST API with per-request `SET LOCAL ROLE` and claim GUCs so Postgres RLS does the authorization.
 
 ```ts
-import { createPgb } from "pgb";
+import { createPgb } from "pgbase";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 
-const pgb = createPgb({
+const pgbase = createPgb({
   database,                                         // your Kysely instance
   getSession: (req) => ({ role: "authenticated" }), // -> SET LOCAL ROLE + claim GUCs
 });
@@ -35,11 +35,11 @@ const pgb = createPgb({
 Install straight from GitHub with [Bun](https://bun.sh):
 
 ```sh
-bun add github:andeshq/pgb        # latest default branch
-bun add github:andeshq/pgb#v0.1.0 # pinned to a tag
+bun add github:andeshq/pgbase        # latest default branch
+bun add github:andeshq/pgbase#v0.1.0 # pinned to a tag
 ```
 
-pgb ships its `.ts` sources and Bun strips the types on import — no build step.
+pgbase ships its `.ts` sources and Bun strips the types on import — no build step.
 `kysely` is a peer dependency; `pg` is only needed for the Postgres driver you
 pass to Kysely.
 
@@ -52,13 +52,13 @@ pass to Kysely.
 ```ts
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
-import { createPgb } from "pgb";
+import { createPgb } from "pgbase";
 
 const db = new Kysely({
   dialect: new PostgresDialect({ pool: new Pool({ connectionString: process.env.DATABASE_URL }) }),
 });
 
-const pgb = createPgb({
+const pgbase = createPgb({
   database,
   schemaName: "public",
   basePath: "/rest/v1",
@@ -67,7 +67,7 @@ const pgb = createPgb({
 
 // Node's http server (see `example/server.ts` for the small web adapter)
 createServer(async (req, res) => {
-  const response = await pgb.handler(await toWebRequest(req));
+  const response = await pgbase.handler(await toWebRequest(req));
   await sendWebResponse(res, response);
 }).listen(3000);
 ```
@@ -80,7 +80,7 @@ curl 'http://localhost:3000/rest/v1/books?select=title,author:authors(name)&publ
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `database` | `Kysely<DB>` | — | **Required.** Your Kysely instance. pgb never opens its own connection. |
+| `database` | `Kysely<DB>` | — | **Required.** Your Kysely instance. pgbase never opens its own connection. |
 | `schemaName` | `string \| string[]` | `"public"` | Exposed Postgres schema (the first entry is used until multi-schema lands). |
 | `extraSearchPath` | `string[]` | `["public"]` | Extra schemas on the request `search_path` so extensions resolve. Mirrors `db-extra-search-path`. |
 | `basePath` | `string` | `""` | Mount point, e.g. `/rest/v1`. The root route lists exposed relations. |
@@ -104,24 +104,24 @@ curl 'http://localhost:3000/rest/v1/books?select=title,author:authors(name)&publ
 
 ## Attaching to a router
 
-`pgb.handler` is a plain `(Request) => Promise<Response>`, so it works anywhere.
+`pgbase.handler` is a plain `(Request) => Promise<Response>`, so it works anywhere.
 
 **Node (`http`)**
 
-`pgb.handler` is web-standard, so Node just needs a tiny `IncomingMessage` ↔
+`pgbase.handler` is web-standard, so Node just needs a tiny `IncomingMessage` ↔
 `Request` adapter (see `example/server.ts`):
 
 ```ts
 createServer(async (req, res) => {
   const request = await toWebRequest(req);
-  await sendWebResponse(res, await pgb.handler(request));
+  await sendWebResponse(res, await pgbase.handler(request));
 }).listen(3000);
 ```
 
 **Bun.serve**
 
 ```ts
-Bun.serve({ fetch: pgb.handler });
+Bun.serve({ fetch: pgbase.handler });
 ```
 
 **Hono**
@@ -129,27 +129,27 @@ Bun.serve({ fetch: pgb.handler });
 ```ts
 import { Hono } from "hono";
 const app = new Hono();
-app.all("/rest/v1/*", (c) => pgb.handler(c.req.raw));
+app.all("/rest/v1/*", (c) => pgbase.handler(c.req.raw));
 ```
 
 **Elysia**
 
 ```ts
-new Elysia().all("/rest/v1/*", ({ request }) => pgb.handler(request));
+new Elysia().all("/rest/v1/*", ({ request }) => pgbase.handler(request));
 ```
 
 **Next.js (App Router)**
 
 ```ts
-export const GET = (request: Request) => pgb.handler(request);
+export const GET = (request: Request) => pgbase.handler(request);
 ```
 
 ## Auth, roles and RLS
 
-pgb is **auth-mechanism agnostic**. It never verifies tokens or reads cookies —
+pgbase is **auth-mechanism agnostic**. It never verifies tokens or reads cookies —
 you resolve the request's identity however you like (sessions, JWT, API keys,
 mTLS) and return a claim object from `getSession`. The only required field is
-`role`; everything else is context for the database. pgb then:
+`role`; everything else is context for the database. pgbase then:
 
 1. `SET LOCAL ROLE <claims.role>` (or `anonRole` when `getSession` returns `null`)
 2. `set_config('search_path', '<schemaName>, <extraSearchPath>', true)`
@@ -194,7 +194,7 @@ createPgb({
 
 Throwing is how you reject invalid/expired credentials with a specific status:
 throw a `PgbError` (e.g. `new PgbError("PGRST301", "Invalid token", 401)`), or
-any error carrying a numeric `status`/`statusCode` — pgb honours it as-is. This
+any error carrying a numeric `status`/`statusCode` — pgbase honours it as-is. This
 matches how `auth.api.getSession` returns `null` for anonymous but throws for
 real failures.
 
@@ -240,8 +240,8 @@ entirely, the connection's role is kept.
 
 ### Hono + Better Auth
 
-Because `pgb` never touches auth, it composes with any middleware. A Hono app
-can resolve the session once and let pgb resolve it too (or memoize):
+Because `pgbase` never touches auth, it composes with any middleware. A Hono app
+can resolve the session once and let pgbase resolve it too (or memoize):
 
 ```ts
 export const sessionMiddleware = createMiddleware<Env>(async (c, next) => {
@@ -250,7 +250,7 @@ export const sessionMiddleware = createMiddleware<Env>(async (c, next) => {
 });
 
 app.use("/rest/v1/*", sessionMiddleware);
-app.all("/rest/v1/*", (c) => pgb.handler(c.req.raw));
+app.all("/rest/v1/*", (c) => pgbase.handler(c.req.raw));
 ```
 
 ## Supported PostgREST syntax
@@ -404,7 +404,7 @@ The integration suite covers embedding (to-one/to-many/many-to-many), `!inner`, 
 - **Schema cache reload** on `NOTIFY pgrst, 'reload schema'` when `refreshOnNotify` and a `createListenClient` are provided:
 
   ```ts
-  const pgb = createPgb({
+  const pgbase = createPgb({
     database,
     refreshOnNotify: true,
     createListenClient: async () => {
@@ -413,11 +413,11 @@ The integration suite covers embedding (to-one/to-many/many-to-many), `!inner`, 
       return client;
     },
   });
-  const listener = await pgb.listen();
+  const listener = await pgbase.listen();
   // ...later: await listener.stop();
   ```
 
-- **No-role safety net**: if neither `getSession` nor `anonRole` is configured, pgb warns that requests run with the connection's role. Set `allowConnectionRole: true` to acknowledge.
+- **No-role safety net**: if neither `getSession` nor `anonRole` is configured, pgbase warns that requests run with the connection's role. Set `allowConnectionRole: true` to acknowledge.
 
 ## Not yet implemented
 

@@ -1,14 +1,14 @@
 import { sql, type Kysely } from "kysely";
 import type {
-  PgbColumn,
-  PgbExposed,
-  PgbForeignKey,
-  PgbFunction,
-  PgbFunctionArg,
-  PgbRelation,
-  PgbSchema,
+  PgbaseColumn,
+  PgbaseExposed,
+  PgbaseForeignKey,
+  PgbaseFunction,
+  PgbaseFunctionArg,
+  PgbaseRelation,
+  PgbaseSchema,
 } from "../types.ts";
-import { PgbError } from "../errors.ts";
+import { PgbaseError } from "../errors.ts";
 
 interface RelationRow {
   name: string;
@@ -79,7 +79,7 @@ function unquoteArrayEntry(entry: string): string {
   return trimmed;
 }
 
-const RELKIND: Record<string, PgbRelation["kind"]> = {
+const RELKIND: Record<string, PgbaseRelation["kind"]> = {
   r: "table",
   v: "view",
   m: "materialized_view",
@@ -87,7 +87,7 @@ const RELKIND: Record<string, PgbRelation["kind"]> = {
   f: "foreign_table",
 };
 
-function isExposed(name: string, kind: PgbRelation["kind"], exposed: PgbExposed | false | undefined): boolean {
+function isExposed(name: string, kind: PgbaseRelation["kind"], exposed: PgbaseExposed | false | undefined): boolean {
   if (exposed === false) return false;
   if (exposed === undefined) return true;
   const isView = kind === "view" || kind === "materialized_view";
@@ -104,8 +104,8 @@ function isExposed(name: string, kind: PgbRelation["kind"], exposed: PgbExposed 
 export async function introspect(
   db: Kysely<any>,
   schemaName: string,
-  exposed: PgbExposed | false | undefined,
-): Promise<PgbSchema> {
+  exposed: PgbaseExposed | false | undefined,
+): Promise<PgbaseSchema> {
   const relationRows = await sql<RelationRow>`
     select c.relname as name, c.relkind as kind, c.oid as oid
     from pg_class c
@@ -157,7 +157,7 @@ export async function introspect(
     order by con.conname, k.ord
   `.execute(db);
 
-  const columnsByTable = new Map<string, PgbColumn[]>();
+  const columnsByTable = new Map<string, PgbaseColumn[]>();
   for (const row of columnRows.rows) {
     const list = columnsByTable.get(row.table_name) ?? [];
     list.push({
@@ -182,8 +182,8 @@ export async function introspect(
     map.set(row.table_name, list);
   }
 
-  const foreignKeys: PgbForeignKey[] = [];
-  const fkByConstraint = new Map<string, PgbForeignKey>();
+  const foreignKeys: PgbaseForeignKey[] = [];
+  const fkByConstraint = new Map<string, PgbaseForeignKey>();
   for (const row of fkRows.rows) {
     let fk = fkByConstraint.get(row.constraint_name);
     if (!fk) {
@@ -201,8 +201,8 @@ export async function introspect(
     fk.toColumns.push(row.to_column);
   }
 
-  const relations: PgbRelation[] = [];
-  const tables = new Map<string, PgbRelation>();
+  const relations: PgbaseRelation[] = [];
+  const tables = new Map<string, PgbaseRelation>();
   for (const row of relationRows.rows) {
     const kind = RELKIND[row.kind] ?? "table";
     if (!isExposed(row.name, kind, exposed)) continue;
@@ -224,11 +224,11 @@ export async function introspect(
   return { schema: schemaName, relations, tables, foreignKeys, functions };
 }
 
-function parseArgs(row: RawFunctionRow): { args: PgbFunctionArg[]; columns: Array<{ name: string }> } {
+function parseArgs(row: RawFunctionRow): { args: PgbaseFunctionArg[]; columns: Array<{ name: string }> } {
   const names = row.arg_names;
   const rawModes = toStringArray(row.arg_modes);
   const modes = rawModes ?? new Array(names?.length ?? 0).fill("i");
-  const args: PgbFunctionArg[] = [];
+  const args: PgbaseFunctionArg[] = [];
   const columns: Array<{ name: string }> = [];
 
   for (let i = 0; i < (names?.length ?? 0); i++) {
@@ -251,7 +251,7 @@ function parseArgs(row: RawFunctionRow): { args: PgbFunctionArg[]; columns: Arra
   return { args, columns };
 }
 
-async function introspectFunctions(db: Kysely<any>, schemaName: string): Promise<Map<string, PgbFunction>> {
+async function introspectFunctions(db: Kysely<any>, schemaName: string): Promise<Map<string, PgbaseFunction>> {
   const rows = await sql<RawFunctionRow>`
     select p.proname as name,
            p.prokind as kind,
@@ -273,10 +273,10 @@ async function introspectFunctions(db: Kysely<any>, schemaName: string): Promise
     order by p.proname
   `.execute(db);
 
-  const functions = new Map<string, PgbFunction>();
+  const functions = new Map<string, PgbaseFunction>();
   for (const row of rows.rows as unknown as RawFunctionRow[]) {
     const { args, columns } = parseArgs(row);
-    const fn: PgbFunction = {
+    const fn: PgbaseFunction = {
       schema: schemaName,
       name: row.name,
       kind: row.kind,

@@ -4,14 +4,14 @@ import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import { buildCountQuery, buildReadQuery, type ExecContext } from "../src/query/compile.ts";
 import { parseRequest } from "../src/parse/request.ts";
-import type { PgbForeignKey, PgbRelation, PgbSchema } from "../src/types.ts";
+import type { PgbaseForeignKey, PgbaseRelation, PgbaseSchema } from "../src/types.ts";
 
 // A Kysely instance is only needed to *compile* SQL here; the pool is never used.
 const db = new Kysely<any>({
   dialect: new PostgresDialect({ pool: new Pool({ connectionString: "postgres://localhost:1/none" }) }),
 });
 
-function relation(name: string, columns: Array<[string, string]>, pk: string[] = ["id"]): PgbRelation {
+function relation(name: string, columns: Array<[string, string]>, pk: string[] = ["id"]): PgbaseRelation {
   const cols = columns.map(([col, udt], i) => ({
     name: col,
     type: udt.startsWith("_") ? "ARRAY" : "USER-DEFINED",
@@ -44,14 +44,14 @@ const books = relation("books", [
 const tags = relation("tags", [["id", "int4"], ["name", "text"]]);
 const bookTags = relation("book_tags", [["book_id", "int4"], ["tag_id", "int4"]], []);
 
-const foreignKeys: PgbForeignKey[] = [
+const foreignKeys: PgbaseForeignKey[] = [
   { constraint: "books_author_id_fkey", fromTable: "books", fromColumns: ["author_id"], toTable: "authors", toColumns: ["id"] },
   { constraint: "book_tags_book_id_fkey", fromTable: "book_tags", fromColumns: ["book_id"], toTable: "books", toColumns: ["id"] },
   { constraint: "book_tags_tag_id_fkey", fromTable: "book_tags", fromColumns: ["tag_id"], toTable: "tags", toColumns: ["id"] },
 ];
 
 const relations = [authors, books, tags, bookTags];
-const schema: PgbSchema = {
+const schema: PgbaseSchema = {
   schema: "public",
   relations,
   tables: new Map(relations.map((r) => [r.name, r])),

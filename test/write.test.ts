@@ -2,7 +2,7 @@ import { after as afterAll, before as beforeAll, describe, test } from "node:tes
 import { expect } from "./expect.ts";
 import { Client, Pool } from "pg";
 import { Kysely, PostgresDialect } from "kysely";
-import { createPgb } from "../src/index.ts";
+import { createPgbase } from "../src/index.ts";
 
 const DATABASE_URL = process.env.PGB_TEST_DATABASE_URL;
 const suite = DATABASE_URL ? describe : describe.skip;
@@ -55,10 +55,10 @@ suite("writes against Postgres", () => {
   let client: Client;
   let pool: Pool;
   let db: Kysely<any>;
-  let pgb: ReturnType<typeof createPgb>;
+  let pgbase: ReturnType<typeof createPgbase>;
 
   const call = (path: string, init?: RequestInit) =>
-    pgb.handler(
+    pgbase.handler(
       new Request(`http://localhost/rest/v1${path}`, {
         ...init,
         headers: { "content-type": "application/json", ...(init?.headers as any) },
@@ -72,7 +72,7 @@ suite("writes against Postgres", () => {
 
     pool = new Pool({ connectionString: DATABASE_URL, max: 4 });
     db = new Kysely<any>({ dialect: new PostgresDialect({ pool }) });
-    pgb = createPgb({
+    pgbase = createPgbase({
       database: db,
       schemaName: "write_schema",
       basePath: "/rest/v1",

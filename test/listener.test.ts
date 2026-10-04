@@ -2,7 +2,7 @@ import { after as afterAll, before as beforeAll, describe, test } from "node:tes
 import { expect } from "./expect.ts";
 import { Client, Pool } from "pg";
 import { Kysely, PostgresDialect } from "kysely";
-import { createPgb } from "../src/index.ts";
+import { createPgbase } from "../src/index.ts";
 
 const DATABASE_URL = process.env.PGB_TEST_DATABASE_URL;
 const suite = DATABASE_URL ? describe : describe.skip;
@@ -33,7 +33,7 @@ suite("schema NOTIFY listener", () => {
   });
 
   test("NOTIFY pgrst reloads the schema cache", async () => {
-    const pgb = createPgb({
+    const pgbase = createPgbase({
       database: db,
       schemaName: "note",
       basePath: "/api",
@@ -46,11 +46,11 @@ suite("schema NOTIFY listener", () => {
       },
     } as any);
 
-    const before = await pgb.schema();
+    const before = await pgbase.schema();
     expect(before.tables.has("t")).toBe(true);
     expect(before.tables.has("late")).toBe(false);
 
-    const listener = await pgb.listen();
+    const listener = await pgbase.listen();
 
     // Create a new relation, then notify. The listener should re-introspect.
     await client.query("create table note.late (id serial primary key)");
@@ -58,7 +58,7 @@ suite("schema NOTIFY listener", () => {
 
     // Give the notification a moment to round-trip.
     await new Promise((resolve) => setTimeout(resolve, 300));
-    const after = await pgb.schema();
+    const after = await pgbase.schema();
     expect(after.tables.has("late")).toBe(true);
 
     await listener.stop();
@@ -66,8 +66,8 @@ suite("schema NOTIFY listener", () => {
   });
 
   test("listener is a no-op without refreshOnNotify", async () => {
-    const pgb = createPgb({ database: db, schemaName: "note", basePath: "/api" } as any);
-    const handle = await pgb.listen();
+    const pgbase = createPgbase({ database: db, schemaName: "note", basePath: "/api" } as any);
+    const handle = await pgbase.listen();
     expect(typeof handle.stop).toBe("function");
     await handle.stop();
   });

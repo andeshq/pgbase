@@ -1,20 +1,20 @@
-export { createPgb } from "./pgb.ts";
-export { PgbError } from "./errors.ts";
+export { createPgbase } from "./pgbase.ts";
+export { PgbaseError } from "./errors.ts";
 
 export type {
   ListenClient,
   MaybePromise,
-  Pgb,
-  PgbColumn,
-  PgbConfig,
-  PgbContext,
-  PgbExposed,
-  PgbForeignKey,
-  PgbFunction,
-  PgbFunctionArg,
-  PgbRelation,
-  PgbSchema,
-  PgbSession,
+  Pgbase,
+  PgbaseColumn,
+  PgbaseConfig,
+  PgbaseContext,
+  PgbaseExposed,
+  PgbaseForeignKey,
+  PgbaseFunction,
+  PgbaseFunctionArg,
+  PgbaseRelation,
+  PgbaseSchema,
+  PgbaseSession,
 } from "./types.ts";
 
 export { startSchemaListener } from "./schema-listener.ts";

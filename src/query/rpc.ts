@@ -1,8 +1,8 @@
 import { sql } from "kysely";
 import type { OrderTerm, ParsedRpc } from "../ast.ts";
-import { PgbError } from "../errors.ts";
+import { PgbaseError } from "../errors.ts";
 import { splitRpcParams } from "../parse/request.ts";
-import type { PgbFunction, PgbRelation } from "../types.ts";
+import type { PgbaseFunction, PgbaseRelation } from "../types.ts";
 import { buildSelectionList, type ExecContext } from "./compile.ts";
 import { renderFilter, type QueryLevel } from "./filters.ts";
 import { RPC_ALIAS } from "./aliases.ts";
@@ -10,7 +10,7 @@ import { RPC_ALIAS } from "./aliases.ts";
 export interface RpcContext extends ExecContext {
   rpc: ParsedRpc;
   /** The introspected function being called. */
-  fn: PgbFunction;
+  fn: PgbaseFunction;
   /** Index into `rpc.bulkArgs` when executing `Prefer: params=bulk`. */
   rpcIndex?: number;
 }
@@ -56,7 +56,7 @@ function resolveCall(ctx: RpcContext, body: unknown, method: string): CallArgs {
   return { named: splitRpcParams(ctx.rpc.queryArgs, ctx.fn.args.map((a) => a.name)).args, positional: null };
 }
 
-function buildCallExpression(fn: PgbFunction, call: CallArgs): ReturnType<typeof sql> {
+function buildCallExpression(fn: PgbaseFunction, call: CallArgs): ReturnType<typeof sql> {
   const target = sql`${sql.id(fn.schema, fn.name)}`;
   if (call.positional) {
     return sql`${target}(${sql.join(call.positional.map((value) => sql`${value}`))})`;
@@ -67,16 +67,16 @@ function buildCallExpression(fn: PgbFunction, call: CallArgs): ReturnType<typeof
   return sql`${target}(${sql.join(args)})`;
 }
 
-function assertArgs(fn: PgbFunction, call: CallArgs): void {
+function assertArgs(fn: PgbaseFunction, call: CallArgs): void {
   if (call.positional) {
     if (call.positional.length < fn.requiredArgCount) {
-      throw PgbError.functionNotFound(fn.name);
+      throw PgbaseError.functionNotFound(fn.name);
     }
     return;
   }
   for (const arg of fn.args) {
     const provided = Object.prototype.hasOwnProperty.call(call.named, arg.name);
-    if (!provided && !arg.hasDefault) throw PgbError.functionNotFound(fn.name);
+    if (!provided && !arg.hasDefault) throw PgbaseError.functionNotFound(fn.name);
   }
 }
 
@@ -130,8 +130,8 @@ export async function executeRpc(ctx: RpcContext, method: string, body: unknown)
  * A lightweight relation-shaped view of a SETOF function's result so the select
  * builder can project columns. `columns` come from the return table when known.
  */
-function makeLevel(fn: PgbFunction, relation: PgbRelation | undefined, columns: PgbRelation["columns"]): QueryLevel {
-  const base: PgbRelation = relation ?? {
+function makeLevel(fn: PgbaseFunction, relation: PgbaseRelation | undefined, columns: PgbaseRelation["columns"]): QueryLevel {
+  const base: PgbaseRelation = relation ?? {
     name: fn.name,
     schema: fn.schema,
     kind: "table",
@@ -148,7 +148,7 @@ function makeLevel(fn: PgbFunction, relation: PgbRelation | undefined, columns: 
 }
 
 /** When a SETOF returns an anonymous record, fall back to the declared columns. */
-function inferColumns(fn: PgbFunction): PgbRelation["columns"] {
+function inferColumns(fn: PgbaseFunction): PgbaseRelation["columns"] {
   const out = fn.args
     .filter((arg) => arg.mode === "o" || arg.mode === "t")
     .map((arg, index) => ({

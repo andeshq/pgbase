@@ -18,7 +18,7 @@ export interface ListenClient {
 }
 
 /** A column as introspected from the database. */
-export interface PgbColumn {
+export interface PgbaseColumn {
   name: string;
   /** `information_schema.columns.data_type`, e.g. `integer`, `ARRAY`, `USER-DEFINED`. */
   type: string;
@@ -30,7 +30,7 @@ export interface PgbColumn {
   isArray: boolean;
 }
 
-export interface PgbForeignKey {
+export interface PgbaseForeignKey {
   constraint: string;
   fromTable: string;
   fromColumns: string[];
@@ -38,17 +38,17 @@ export interface PgbForeignKey {
   toColumns: string[];
 }
 
-export interface PgbRelation {
+export interface PgbaseRelation {
   name: string;
   schema: string;
   kind: "table" | "view" | "materialized_view" | "partitioned_table" | "foreign_table";
-  columns: PgbColumn[];
-  columnMap: Map<string, PgbColumn>;
+  columns: PgbaseColumn[];
+  columnMap: Map<string, PgbaseColumn>;
   primaryKey: string[] | null;
   uniques: string[][];
 }
 
-export interface PgbFunctionArg {
+export interface PgbaseFunctionArg {
   name: string;
   type: string;
   /** `i` input, `o` output, `b` inout, `t` table, `v` variadic. */
@@ -56,7 +56,7 @@ export interface PgbFunctionArg {
   hasDefault: boolean;
 }
 
-export interface PgbFunction {
+export interface PgbaseFunction {
   schema: string;
   name: string;
   /** `f` function, `p` procedure, `a` aggregate, `w` window. */
@@ -68,28 +68,28 @@ export interface PgbFunction {
   returnType: string;
   returnRelation: string | null;
   securityDefiner: boolean;
-  args: PgbFunctionArg[];
+  args: PgbaseFunctionArg[];
   /** Number of leading input args without defaults (positional call minimum). */
   requiredArgCount: number;
   /** Declared output/table columns (for anonymous record returns). */
   columns: Array<{ name: string }>;
 }
 
-export interface PgbSchema {
+export interface PgbaseSchema {
   schema: string;
-  relations: PgbRelation[];
-  tables: Map<string, PgbRelation>;
-  foreignKeys: PgbForeignKey[];
-  functions: Map<string, PgbFunction>;
+  relations: PgbaseRelation[];
+  tables: Map<string, PgbaseRelation>;
+  foreignKeys: PgbaseForeignKey[];
+  functions: Map<string, PgbaseFunction>;
 }
 
-export interface PgbExposed {
+export interface PgbaseExposed {
   tables?: string[];
   views?: string[];
 }
 
-export interface PgbContext {
-  schema: PgbSchema;
+export interface PgbaseContext {
+  schema: PgbaseSchema;
   schemaName: string;
   url: URL;
   table?: string;
@@ -103,7 +103,7 @@ export interface PgbContext {
  * context exposed to Postgres. Auth-mechanism agnostic: JWTs, sessions, API
  * keys and mTLS all map onto this.
  */
-export interface PgbSession {
+export interface PgbaseSession {
   /** Postgres role to impersonate for this request (`SET LOCAL ROLE`). */
   role: string;
   /**
@@ -112,7 +112,7 @@ export interface PgbSession {
    * existing RLS policies keep working.
    */
   [claim: string]: unknown;
-}export interface PgbConfig<DB = unknown> {
+}export interface PgbaseConfig<DB = unknown> {
   /** Your Kysely instance. pgb never opens its own connection. */
   database: Kysely<DB>;
   /**
@@ -143,7 +143,7 @@ export interface PgbSession {
   /**
    * Restrict which tables/views are reachable. Omit to expose everything.
    */
-  exposed?: PgbExposed | false;
+  exposed?: PgbaseExposed | false;
   /**
    * Role used when `getSession` returns `null`. Mirrors PostgREST's
    * `db-anon-role`.
@@ -151,7 +151,7 @@ export interface PgbSession {
    * When both `getSession` and `anonRole` are unset, requests run with the
    * connection's own role. That is convenient for admin-only deployments but
    * risks privilege escalation if the pool connects as an owner, so pgb warns
-   * unless {@link PgbConfig.allowConnectionRole} opts in explicitly.
+   * unless {@link PgbaseConfig.allowConnectionRole} opts in explicitly.
    */
   anonRole?: string;
   /**
@@ -175,13 +175,13 @@ export interface PgbSession {
   /**
    * Reload the schema cache when Postgres emits
    * `NOTIFY pgrst, 'reload schema'`, matching PostgREST. Requires
-   * {@link PgbConfig.createListenClient} to open a dedicated connection
+   * {@link PgbaseConfig.createListenClient} to open a dedicated connection
    * (LISTEN cannot share a pooled client).
    */
   refreshOnNotify?: boolean;
   /**
    * Factory for the dedicated LISTEN connection used by
-   * {@link PgbConfig.refreshOnNotify}. Return a connected `pg` `Client`.
+   * {@link PgbaseConfig.refreshOnNotify}. Return a connected `pg` `Client`.
    */
   createListenClient?: () => MaybePromise<ListenClient>;
   /** Postgres NOTIFY channel. Defaults to `pgrst`. */
@@ -192,14 +192,14 @@ export interface PgbSession {
    *
    * - `role` is required: pgb runs `SET LOCAL ROLE <role>`. Every other key is
    *   exposed to Postgres as `request.jwt.claims` and `request.jwt.claim.<key>`.
-   * - return `null` — no session; fall back to {@link PgbConfig.anonRole}.
-   * - throw — the error becomes the HTTP response. Throw a `PgbError` for a
+   * - return `null` — no session; fall back to {@link PgbaseConfig.anonRole}.
+   * - throw — the error becomes the HTTP response. Throw a `PgbaseError` for a
    *   specific status/code (e.g. 401); any thrown error carrying a numeric
    *   `status`/`statusCode` is honoured as-is.
    *
    * pgb never verifies tokens or reads cookies; that is entirely the host's job.
    */
-  getSession?: (request: Request) => MaybePromise<PgbSession | null>;
+  getSession?: (request: Request) => MaybePromise<PgbaseSession | null>;
   /** Runs before routing/schema loading. Return a Response to short-circuit. */
   onRequest?: (request: Request) => MaybePromise<Response | void>;
   /** Runs when an error is thrown. Return a Response to override the default. */
@@ -207,17 +207,17 @@ export interface PgbSession {
   debug?: boolean;
 }
 
-export interface Pgb<DB = unknown> {
+export interface Pgbase<DB = unknown> {
   /** Web-standard handler. Attach to Node's http, Bun.serve, Deno.serve, Hono, Elysia, Next, etc. */
   handler(request: Request): Promise<Response>;
-  /** Alias of {@link Pgb.handler}, convenient for `{ fetch: pgb.fetch }`. */
+  /** Alias of {@link Pgbase.handler}, convenient for `{ fetch: pgb.fetch }`. */
   fetch: (request: Request) => Promise<Response>;
   /** The current introspected schema (loads lazily on first call). */
-  schema(): Promise<PgbSchema>;
+  schema(): Promise<PgbaseSchema>;
   /** Re-introspect the database schema. */
-  refresh(): Promise<PgbSchema>;
+  refresh(): Promise<PgbaseSchema>;
   /**
-   * Start the NOTIFY schema listener, if {@link PgbConfig.refreshOnNotify} is
+   * Start the NOTIFY schema listener, if {@link PgbaseConfig.refreshOnNotify} is
    * enabled. Idempotent. Returns a `stop()` that closes the listener.
    */
   listen(): Promise<{ stop(): Promise<void> }>;

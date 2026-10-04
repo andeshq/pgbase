@@ -1,8 +1,8 @@
 import type { ParsedMutation, ParsedRpc, ParsedRequest } from "./ast.ts";
-import { PgbError, fromPostgresError } from "./errors.ts";
+import { PgbaseError, fromPostgresError } from "./errors.ts";
 import type { ReadResult } from "./query/compile.ts";
 import type { MutationResult } from "./query/write.ts";
-import type { PgbContext } from "./types.ts";
+import type { PgbaseContext } from "./types.ts";
 
 export type ErrorVerbosity = "verbose" | "minimal";
 
@@ -58,7 +58,7 @@ export function errorResponse(
   error: unknown,
   verbosity: "verbose" | "minimal" = "verbose",
 ): Response {
-  const pgbError = error instanceof PgbError ? error : fromPostgresError(error, verbosity);
+  const pgbError = error instanceof PgbaseError ? error : fromPostgresError(error, verbosity);
   const headers = new Headers(pgbError.headers ?? {});
   headers.set("Content-Type", "application/json; charset=utf-8");
   return new Response(JSON.stringify(pgbError.toJSON()), {
@@ -80,7 +80,7 @@ function contentRange(request: ParsedRequest, rows: any[], count: number | null)
 
 export function buildResponse(request: ParsedRequest, result: ReadResult, method: string): Response {
   const { rows, count } = result;
-  if (request.singular && rows.length !== 1) throw PgbError.notSingular(rows.length);
+  if (request.singular && rows.length !== 1) throw PgbaseError.notSingular(rows.length);
 
   const headers = new Headers();
   headers.set("Content-Range", contentRange(request, rows, count));
@@ -111,7 +111,7 @@ function appliedPreferences(request: ParsedMutation): string {
   return parts.join(", ");
 }
 
-function writeStatus(request: ParsedMutation, ctx: PgbContext, count: number | null, inserted?: boolean): number {
+function writeStatus(request: ParsedMutation, ctx: PgbaseContext, count: number | null, inserted?: boolean): number {
   if (ctx.role === "anon" && count === 0 && request.method !== "POST") return 401;
   if (request.method === "PUT") return inserted === false ? 200 : 201;
   return request.method === "POST" ? 201 : 200;
@@ -120,13 +120,13 @@ function writeStatus(request: ParsedMutation, ctx: PgbContext, count: number | n
 export function buildWriteResponse(
   request: ParsedMutation,
   result: MutationResult,
-  ctx: PgbContext,
+  ctx: PgbaseContext,
   basePath = "",
 ): Response {
   const { rows, count, affected } = result;
   const represent = request.prefer.return === "representation";
 
-  if (request.singular && represent && rows.length !== 1) throw PgbError.notSingular(rows.length);
+  if (request.singular && represent && rows.length !== 1) throw PgbaseError.notSingular(rows.length);
 
   const headers = new Headers();
   const applied = appliedPreferences(request);

@@ -2,7 +2,7 @@ import { after as afterAll, before as beforeAll, describe, test } from "node:tes
 import { expect } from "./expect.ts";
 import { Client, Pool } from "pg";
 import { Kysely, PostgresDialect } from "kysely";
-import { createPgb } from "../src/index.ts";
+import { createPgbase } from "../src/index.ts";
 
 const DATABASE_URL = process.env.PGB_TEST_DATABASE_URL;
 const suite = DATABASE_URL ? describe : describe.skip;
@@ -44,15 +44,15 @@ suite("hardening: tier 1 + 2", () => {
   let db: Kysely<any>;
   let base: any;
 
-  const call = (path: string, init?: RequestInit, pgb = undefined as any) =>
-    (pgb ?? make).handler(
+  const call = (path: string, init?: RequestInit, pgbase = undefined as any) =>
+    (pgbase ?? make).handler(
       new Request(`http://localhost/api${path}`, {
         ...init,
         headers: { "content-type": "application/json", ...(init?.headers as any) },
       }),
     );
 
-  let make: ReturnType<typeof createPgb>;
+  let make: ReturnType<typeof createPgbase>;
 
   beforeAll(async () => {
     client = new Client({ connectionString: DATABASE_URL });
@@ -68,7 +68,7 @@ suite("hardening: tier 1 + 2", () => {
       anonRole: "anon",
       getSession: () => ({ role: "authenticated" }),
     };
-    make = createPgb(base as any);
+    make = createPgbase(base as any);
   });
 
   afterAll(async () => {
@@ -78,14 +78,14 @@ suite("hardening: tier 1 + 2", () => {
 
   // -- Tier 1.2: maxRows caps RPC --------------------------------------------
   test("maxRows caps SETOF RPC results", async () => {
-    const capped = createPgb({ ...base, maxRows: 2 } as any);
+    const capped = createPgbase({ ...base, maxRows: 2 } as any);
     const res = await call("/rpc/many_rows?select=id", { method: "POST", body: JSON.stringify({ n: 5 }) }, capped);
     expect(res.status).toBe(200);
     expect(((await res.json()) as any[]).length).toBe(2);
   });
 
   test("RPC count is a real count, not the row count", async () => {
-    const capped = createPgb({ ...base, maxRows: 2 } as any);
+    const capped = createPgbase({ ...base, maxRows: 2 } as any);
     // `items` may have grown from earlier tests, so compute the expected total.
     const rows = await client.query("select count(*)::int as n from hard.items");
     const expected = rows.rows[0].n * 5;
@@ -118,7 +118,7 @@ suite("hardening: tier 1 + 2", () => {
 
   // -- Tier 2: body size limit -----------------------------------------------
   test("oversized body returns 413", async () => {
-    const small = createPgb({ ...base, maxBodyBytes: 10 } as any);
+    const small = createPgbase({ ...base, maxBodyBytes: 10 } as any);
     const res = await call("/items", { method: "POST", body: JSON.stringify({ name: "way too long" }) }, small);
     expect(res.status).toBe(413);
     expect(((await res.json()) as any).code).toBe("PGRST113");
@@ -126,14 +126,14 @@ suite("hardening: tier 1 + 2", () => {
 
   test("body at the limit passes", async () => {
     const body = JSON.stringify({ name: "ok" });
-    const exact = createPgb({ ...base, maxBodyBytes: body.length } as any);
+    const exact = createPgbase({ ...base, maxBodyBytes: body.length } as any);
     const res = await call("/items", { method: "POST", body }, exact);
     expect(res.status).toBe(204);
   });
 
   // -- Tier 2: error verbosity ------------------------------------------------
   test("errorVerbosity minimal drops details/hint", async () => {
-    const minimal = createPgb({ ...base, errorVerbosity: "minimal" } as any);
+    const minimal = createPgbase({ ...base, errorVerbosity: "minimal" } as any);
     // A unique violation carries `detail`; force one via a not-null violation.
     const res = await call("/items", { method: "POST", body: JSON.stringify({ secret: "no name" }) }, minimal);
     expect(res.status).toBe(400);
@@ -150,14 +150,14 @@ suite("hardening: tier 1 + 2", () => {
       language sql stable as $$ select current_setting('statement_timeout', true) $$;
       grant execute on function hard.current_timeout() to anon, authenticated;
     `);
-    const withTimeout = createPgb({ ...base, settings: { statement_timeout: "4s" } } as any);
+    const withTimeout = createPgbase({ ...base, settings: { statement_timeout: "4s" } } as any);
     const res = await call("/rpc/current_timeout", { method: "POST", body: "{}" }, withTimeout);
     expect(await res.json()).toEqual(["4s"]);
   });
 
   // -- Tier 1.1: anonRole semantics ------------------------------------------
   test("no session falls back to anonRole", async () => {
-    const noSession = createPgb({ ...base, getSession: undefined } as any);
+    const noSession = createPgbase({ ...base, getSession: undefined } as any);
     const res = await call("/items?select=name", {}, noSession);
     expect(res.status).toBe(200);
   });
@@ -186,7 +186,7 @@ suite("hardening: tier 1 + 2", () => {
     expect(res.status === 400 || res.status === 500).toBe(true);
   });
 
-  test("PgbError is thrown for unknown columns", async () => {
+  test("PgbaseError is thrown for unknown columns", async () => {
     const res = await call("/items?select=nope");
     expect(res.status).toBe(400);
     expect(((await res.json()) as any).code).toBe("PGRST204");

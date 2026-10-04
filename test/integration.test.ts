@@ -2,7 +2,7 @@ import { after as afterAll, before as beforeAll, describe, test } from "node:tes
 import { expect } from "./expect.ts";
 import { Client, Pool } from "pg";
 import { Kysely, PostgresDialect } from "kysely";
-import { createPgb, PgbError } from "../src/index.ts";
+import { createPgbase, PgbaseError } from "../src/index.ts";
 
 const DATABASE_URL = process.env.PGB_TEST_DATABASE_URL;
 const suite = DATABASE_URL ? describe : describe.skip;
@@ -83,8 +83,8 @@ suite("integration against Postgres", () => {
   let client: Client;
   let pool: Pool;
   let db: Kysely<any>;
-  let pgb: ReturnType<typeof createPgb>;
-  let capped: ReturnType<typeof createPgb>;
+  let pgbase: ReturnType<typeof createPgbase>;
+  let capped: ReturnType<typeof createPgbase>;
 
   beforeAll(async () => {
     client = new Client({ connectionString: DATABASE_URL });
@@ -103,15 +103,15 @@ suite("integration against Postgres", () => {
         const sub = request.headers.get("x-sub");
         const role = request.headers.get("x-role") ?? "authenticated";
         if (sub === "invalid") {
-          throw new PgbError("PGRST301", "Invalid token", 401);
+          throw new PgbaseError("PGRST301", "Invalid token", 401);
         }
         if (!sub) return role === "anon" ? { role } : null;
         return { role, sub };
       },
     } as const;
 
-    pgb = createPgb(config as any);
-    capped = createPgb({ ...config, maxRows: 2 } as any);
+    pgbase = createPgbase(config as any);
+    capped = createPgbase({ ...config, maxRows: 2 } as any);
   });
 
   afterAll(async () => {
@@ -120,7 +120,7 @@ suite("integration against Postgres", () => {
   });
 
   const call = (path: string, init?: RequestInit) =>
-    pgb.handler(new Request(`http://localhost/rest/v1${path}`, init as any));
+    pgbase.handler(new Request(`http://localhost/rest/v1${path}`, init as any));
 
   test("to-many embedding", async () => {
     const res = await call("/authors?select=name,books(title)&order=name.asc");
@@ -255,7 +255,7 @@ suite("integration against Postgres", () => {
       body: "{}",
       headers: {
         "x-sub": "u1",
-        "user-agent": "pgb-test/1.0",
+        "user-agent": "pgbase-test/1.0",
         cookie: "sid=abc123; theme=dark",
       },
     });
@@ -265,7 +265,7 @@ suite("integration against Postgres", () => {
       db_role: "authenticated",
       method: "POST",
       path: "rpc/request_probe",
-      header_ua: "pgb-test/1.0",
+      header_ua: "pgbase-test/1.0",
       cookie_sid: "abc123",
       claims_role: "authenticated",
       claims_sub: "u1",
@@ -298,7 +298,7 @@ suite("integration against Postgres", () => {
     expect(missing.status).toBe(404);
     expect(((await missing.json()) as any).code).toBe("PGRST205");
 
-    const wrongBase = await pgb.handler(new Request("http://localhost/wrong/books"));
+    const wrongBase = await pgbase.handler(new Request("http://localhost/wrong/books"));
     expect(wrongBase.status).toBe(404);
   });
 

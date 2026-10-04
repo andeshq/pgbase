@@ -1,14 +1,14 @@
 import { sql, type RawBuilder } from "kysely";
 import { jsonArrayFrom, jsonObjectFrom } from "kysely/helpers/postgres";
 import type { FilterNode, OrderTerm, ParsedRequest, SelectEmbed, SelectNode } from "../ast.ts";
-import { PgbError } from "../errors.ts";
+import { PgbaseError } from "../errors.ts";
 import { resolveRelationship, type Relationship } from "../schema/index.ts";
-import type { PgbRelation, PgbSchema } from "../types.ts";
+import type { PgbaseRelation, PgbaseSchema } from "../types.ts";
 import { renderColumn, renderFilter, type QueryLevel } from "./filters.ts";
 
 export interface ExecContext {
   db: any;
-  schema: PgbSchema;
+  schema: PgbaseSchema;
   /** The parsed request AST. Writes and RPCs narrow this to their own shape. */
   request: ParsedRequest;
   /** The original web request, used by writes to read the body. */
@@ -41,9 +41,9 @@ export async function executeRead(ctx: ExecContext): Promise<ReadResult> {
 // ---------------------------------------------------------------------------
 
 /** Resolve the top-level relation for a table name, or throw PGRST205. */
-export function resolveLevel(schema: PgbSchema, table: string): QueryLevel {
+export function resolveLevel(schema: PgbaseSchema, table: string): QueryLevel {
   const relation = schema.tables.get(table);
-  if (!relation) throw PgbError.tableNotFound(table);
+  if (!relation) throw PgbaseError.tableNotFound(table);
   return { name: relation.name, relation, path: "" };
 }
 
@@ -139,9 +139,9 @@ function makeEmbedBase(
   ctx: ExecContext,
   level: QueryLevel,
   node: SelectEmbed,
-): { sub: any; related: PgbRelation; childLevel: QueryLevel; params: any; relationship: Relationship } {
+): { sub: any; related: PgbaseRelation; childLevel: QueryLevel; params: any; relationship: Relationship } {
   const related = ctx.schema.tables.get(node.relation);
-  if (!related) throw PgbError.tableNotFound(node.relation);
+  if (!related) throw PgbaseError.tableNotFound(node.relation);
   const relationship = resolveRelationship(ctx.schema, level.relation, related, node.hint);
   const childPath = level.path ? `${level.path}.${node.path}` : node.path;
   const childLevel: QueryLevel = { name: node.relation, relation: related, path: childPath };

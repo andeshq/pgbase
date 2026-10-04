@@ -1,5 +1,5 @@
 import type { SelectColumn, SelectEmbed, SelectNode } from "../ast.ts";
-import { PgbError } from "../errors.ts";
+import { PgbaseError } from "../errors.ts";
 import { findOpenParen, isValidCast, splitTopLevel, unquote } from "./util.ts";
 
 /** Parse a PostgREST `select` expression, e.g. `id, author:users!fk(name, email)`. */
@@ -46,7 +46,7 @@ function parseEmbed(item: string, paren: number): SelectEmbed {
     head = head.slice(colon + 1).trim();
   }
   const relation = unquote(head);
-  if (!relation) throw PgbError.parse(`Invalid embedded resource: ${item}`);
+  if (!relation) throw PgbaseError.parse(`Invalid embedded resource: ${item}`);
 
   const children = inner.trim().length > 0 ? parseSelect(inner) : [];
   return {
@@ -69,7 +69,7 @@ function parseColumn(item: string): SelectColumn {
   if (castIdx !== -1) {
     cast = s.slice(castIdx + 2).trim();
     s = s.slice(0, castIdx).trim();
-    if (!isValidCast(cast)) throw PgbError.parse(`Invalid cast in select: ::${cast}`);
+    if (!isValidCast(cast)) throw PgbaseError.parse(`Invalid cast in select: ::${cast}`);
   }
 
   if (s === "*") return { kind: "column", column: "*", star: true };

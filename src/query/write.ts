@@ -1,6 +1,6 @@
 import { sql } from "kysely";
 import type { FilterNode, ParsedMutation, SelectNode } from "../ast.ts";
-import { PgbError, DEFAULT } from "../errors.ts";
+import { PgbaseError, DEFAULT } from "../errors.ts";
 import { buildSelectionList, resolveLevel, type ExecContext } from "./compile.ts";
 import { renderFilter, type QueryLevel } from "./filters.ts";
 import { INSERTED_ALIAS, keyAlias, KEY_PREFIX, AFFECTED_ALIAS } from "./aliases.ts";
@@ -42,26 +42,26 @@ export async function executeMutation(ctx: WriteContext): Promise<MutationResult
 // ---------------------------------------------------------------------------
 
 async function readBodyRows(ctx: WriteContext): Promise<Record<string, unknown>[]> {
-  if (!ctx.raw) throw PgbError.parse("Missing request body");
+  if (!ctx.raw) throw PgbaseError.parse("Missing request body");
   const text = await ctx.raw.clone().text();
-  if (text.length > ctx.maxBodyBytes) throw PgbError.bodyTooLarge(ctx.maxBodyBytes);
+  if (text.length > ctx.maxBodyBytes) throw PgbaseError.bodyTooLarge(ctx.maxBodyBytes);
   if (text.trim() === "") return [];
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
   } catch {
-    throw PgbError.parse("Failed to parse the request body as JSON");
+    throw PgbaseError.parse("Failed to parse the request body as JSON");
   }
   if (Array.isArray(parsed)) {
     if (!parsed.every((row) => row !== null && typeof row === "object" && !Array.isArray(row))) {
-      throw PgbError.parse("Every element of the JSON array body must be an object");
+      throw PgbaseError.parse("Every element of the JSON array body must be an object");
     }
     return parsed as Record<string, unknown>[];
   }
   if (parsed !== null && typeof parsed === "object") {
     return [parsed as Record<string, unknown>];
   }
-  throw PgbError.parse("The request body must be a JSON object or an array of objects");
+  throw PgbaseError.parse("The request body must be a JSON object or an array of objects");
 }
 
 // ---------------------------------------------------------------------------
@@ -82,7 +82,7 @@ function reconcileRow(
   for (const key of Object.keys(row)) {
     const column = key.trim();
     if (!level.relation.columnMap.has(column)) {
-      if (strict) throw PgbError.columnNotFound(column, level.relation.name);
+      if (strict) throw PgbaseError.columnNotFound(column, level.relation.name);
       dropped.add(column);
       continue;
     }
@@ -142,7 +142,7 @@ function primaryKeyPredicate(level: Level, keys: any[]): any {
 
 function requirePrimaryKey(level: Level): string[] {
   const pk = level.relation.primaryKey;
-  if (!pk || pk.length === 0) throw PgbError.relationshipEmpty("Cannot embed: table has no primary key");
+  if (!pk || pk.length === 0) throw PgbaseError.relationshipEmpty("Cannot embed: table has no primary key");
   return pk;
 }
 
@@ -166,7 +166,7 @@ async function selectKeys(ctx: WriteContext, level: Level, filters: FilterNode[]
 function assertFilteredForWrite(level: Level, filters: FilterNode[], method: string): void {
   const isView = level.relation.kind === "view" || level.relation.kind === "materialized_view";
   if (filters.length === 0 && !isView) {
-    throw PgbError.parse(`${method} requires a filter to avoid modifying every row`);
+    throw PgbaseError.parse(`${method} requires a filter to avoid modifying every row`);
   }
 }
 
@@ -195,7 +195,7 @@ function shape(  ctx: WriteContext,
 
 async function executeInsert(ctx: WriteContext, level: Level): Promise<MutationResult> {
   const bodyRows = await readBodyRows(ctx);
-  if (bodyRows.length === 0) throw PgbError.parse("The request body is empty");
+  if (bodyRows.length === 0) throw PgbaseError.parse("The request body is empty");
 
   const dropped = new Set<string>();
   const rows = bodyRows.map((row) => renderValues(reconcileRow(ctx, level, row, dropped)));
@@ -233,7 +233,7 @@ function pick(row: Record<string, unknown>, columns: string[]): Record<string, u
 async function executeUpdate(ctx: WriteContext, level: Level): Promise<MutationResult> {
   const bodyRows = await readBodyRows(ctx);
   if (bodyRows.length !== 1) {
-    throw PgbError.parse("PATCH requires exactly one JSON object in the body");
+    throw PgbaseError.parse("PATCH requires exactly one JSON object in the body");
   }
   const dropped = new Set<string>();
   const changes = reconcileRow(ctx, level, bodyRows[0]!, dropped);
@@ -296,11 +296,11 @@ function stripKeyColumns(row: Record<string, unknown>, pk: string[] | null): Rec
 async function executeUpsert(ctx: WriteContext, level: Level): Promise<MutationResult> {
   const bodyRows = await readBodyRows(ctx);
   if (bodyRows.length !== 1) {
-    throw PgbError.parse("PUT requires exactly one JSON object in the body");
+    throw PgbaseError.parse("PUT requires exactly one JSON object in the body");
   }
   const target = ctx.mutation.onConflict ?? level.relation.primaryKey;
   if (!target || target.length === 0) {
-    throw PgbError.parse("PUT requires a primary key or `on_conflict` to resolve conflicts");
+    throw PgbaseError.parse("PUT requires a primary key or `on_conflict` to resolve conflicts");
   }
 
   const dropped = new Set<string>();

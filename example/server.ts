@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
-import { createPgb, PgbError } from "../src/index.ts";
+import { createPgbase, PgbaseError } from "../src/index.ts";
 
 const connectionString =
   process.env.DATABASE_URL ?? "postgres://postgres:postgres@localhost:55432/pgb";
@@ -9,7 +9,7 @@ const connectionString =
 const pool = new Pool({ connectionString });
 const database = new Kysely({ dialect: new PostgresDialect({ pool }) });
 
-const pgb = createPgb({
+const pgbase = createPgbase({
   database,
   schemaName: "public",
   extraSearchPath: ["public"],
@@ -18,21 +18,21 @@ const pgb = createPgb({
   anonRole: "anon",
 
   /**
-   * Resolve the request's database identity as a claim object. pgb is
+   * Resolve the request's database identity as a claim object. pgbase is
    * auth-agnostic: verify a session/JWT/API key however you like and return the
    * claims. `role` is required (the Postgres role to impersonate); every other
    * key is exposed to Postgres as `request.jwt.claims`.
    *
    *   return null     -> anonymous (anonRole)
    *   return { role } -> SET LOCAL ROLE + request.jwt.claim.*
-   *   throw           -> error response (throw PgbError for 401)
+   *   throw           -> error response (throw PgbaseError for 401)
    */
   getSession: (request) => {
     // Demo: read identity from headers. Replace with your real auth.
     const sub = request.headers.get("x-sub");
     if (!sub) return null;
     if (sub === "invalid") {
-      throw new PgbError("PGRST301", "Invalid token", 401);
+      throw new PgbaseError("PGRST301", "Invalid token", 401);
     }
     return {
       role: request.headers.get("x-role") ?? "authenticated",
@@ -42,7 +42,7 @@ const pgb = createPgb({
   },
 
   onError: (error) => {
-    console.error("[pgb]", error);
+    console.error("[pgbase]", error);
   },
 
   debug: true,
@@ -85,9 +85,9 @@ const server = createServer((req, res) => {
   void (async () => {
     try {
       const request = await toWebRequest(req);
-      await sendWebResponse(res, await pgb.handler(request));
+      await sendWebResponse(res, await pgbase.handler(request));
     } catch (error) {
-      console.error("[pgb] adapter error", error);
+      console.error("[pgbase] adapter error", error);
       res.statusCode = 500;
       res.end("Internal Server Error");
     }
@@ -96,5 +96,5 @@ const server = createServer((req, res) => {
 
 const port = Number(process.env.PORT ?? 3000);
 server.listen(port, () => {
-  console.log(`pgb listening on http://localhost:${port}/rest/v1`);
+  console.log(`pgbase listening on http://localhost:${port}/rest/v1`);
 });

@@ -243,17 +243,50 @@ entirely, the connection's role is kept.
 
 ### Hono + Better Auth
 
-Because `pgbase` never touches auth, it composes with any middleware. A Hono app
-can resolve the session once and let pgbase resolve it too (or memoize):
+Better Auth owns authentication; `pgbase` only consumes the session. Wire it up
+by passing the request headers to `auth.api.getSession` inside `getSession`:
 
 ```ts
-export const sessionMiddleware = createMiddleware<Env>(async (c, next) => {
-  c.set("session", await auth.api.getSession({ headers: c.req.raw.headers }));
-  await next();
+import { Hono } from "hono";
+import { betterAuth } from "better-auth";
+import { createPgbase } from "pgbase";
+
+const auth = betterAuth({
+  database: { db: kysely, type: "postgres" },
+  emailAndPassword: { enabled: true },
 });
 
-app.use("/rest/v1/*", sessionMiddleware);
-app.all("/rest/v1/*", (c) => pgbase.handler(c.req.raw));
+const pgbase = createPgbase({
+  database: kysely,
+  schemaName: "public",
+  basePath: "/rest/v1",
+  anonRole: "anon",
+  getSession: async (request) => {
+    const session = await auth.api.getSession({ headers: request.headers });
+    if (!session) return null;                        // -> anonRole
+    return {
+      role: session.user.role ?? "authenticated",     // required: Postgres role
+      sub: session.user.id,                           // -> request.jwt.claim.sub
+      email: session.user.email,
+    };
+  },
+});
+
+const app = new Hono();
+app.on(["GET", "POST"], "/api/auth/*", (c) => auth.handler(c.req.raw)); // auth
+app.all("/rest/v1/*", (c) => pgbase.handler(c.req.raw));               // pgbase
+```
+
+A runnable version — with RLS policies, sign-up/sign-in, and a demo UI — lives in
+[`example/better-auth-hono.ts`](./example/better-auth-hono.ts):
+
+```sh
+# 1. create the demo table + roles
+psql "$DATABASE_URL" -f example/schema.sql
+# 2. create Better Auth's tables
+bun run example/better-auth-hono.ts migrate
+# 3. serve
+bun run example/better-auth-hono.ts
 ```
 
 ## Supported PostgREST syntax

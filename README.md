@@ -5,11 +5,11 @@ A composable, [PostgREST](https://postgrest.org)-compatible API for [Kysely](htt
 Like Better Auth's `auth.handler`, `pgbase` gives you a web-standard `(Request) => Response` handler that you can attach to any router. You bring your own Kysely instance, your own auth, and your own database; `pgbase` turns it into a PostgREST-style REST API with per-request `SET LOCAL ROLE` and claim GUCs so Postgres RLS does the authorization.
 
 ```ts
-import { createPgb } from "pgbase";
+import { createPgbase } from "pgbase";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 
-const pgbase = createPgb({
+const pgbase = createPgbase({
   database,                                         // your Kysely instance
   getSession: (req) => ({ role: "authenticated" }), // -> SET LOCAL ROLE + claim GUCs
 });
@@ -50,31 +50,33 @@ pass to Kysely.
 ## Quick start
 
 ```ts
+import { Hono } from "hono";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
-import { createPgb } from "pgbase";
+import { createPgbase } from "pgbase";
 
 const db = new Kysely({
   dialect: new PostgresDialect({ pool: new Pool({ connectionString: process.env.DATABASE_URL }) }),
 });
 
-const pgbase = createPgb({
-  database,
+const pgbase = createPgbase({
+  database: db,
   schemaName: "public",
   basePath: "/rest/v1",
   maxRows: 1000,
 });
 
-// Node's http server (see `example/server.ts` for the small web adapter)
-createServer(async (req, res) => {
-  const response = await pgbase.handler(await toWebRequest(req));
-  await sendWebResponse(res, response);
-}).listen(3000);
+const app = new Hono();
+app.all("/rest/v1/*", (c) => pgbase.handler(c.req.raw));
+
+export default app;
 ```
 
 ```sh
 curl 'http://localhost:3000/rest/v1/books?select=title,author:authors(name)&published=eq.true&order=title.asc&limit=5'
 ```
+
+Run it with `bun run app.ts` (or `bunx wrangler`/`node` with a Hono adapter).
 
 ## Configuration
 
@@ -95,12 +97,13 @@ curl 'http://localhost:3000/rest/v1/books?select=title,author:authors(name)&publ
 | `refreshOnNotify` | `boolean` | `false` | Reload the schema cache on `NOTIFY pgrst, 'reload schema'`. |
 | `createListenClient` | `() => ListenClient` | — | Dedicated LISTEN connection for `refreshOnNotify`. |
 | `notifyChannel` | `string` | `"pgrst"` | Channel used by `refreshOnNotify`. |
-| `getSession` | `(req) => PgbSession \| null` | — | Resolve the request's identity as a claim object (`role` required). |
-| `onRequest` | `(req, ctx) => Response \| void` | — | Short-circuit hook. |
-| `onError` | `(err, ctx) => Response \| void` | — | Override error responses. |
+| `getSession` | `(req) => PgbaseSession \| null` | — | Resolve the request's identity as a claim object (`role` required). |
+| `onRequest` | `(req) => Response \| void` | — | Cheap gate that runs before schema loading. Return a `Response` to short-circuit. |
+| `onError` | `(err) => Response \| void` | — | Override error responses. |
 | `debug` | `boolean` | `false` | Log requests/errors. |
 
-`ctx` is a `PgbContext` (`{ schema, schemaName, url, table?, role?, claims? }`).
+Hooks receive only the `Request` (and `onError` the thrown error); internal request
+context (schema, table, role, claims) stays inside pgbase.
 
 ## Attaching to a router
 
@@ -169,7 +172,7 @@ object defaults to `{ role: "<anonRole>" }`. The Postgres-side GUC names stay
 contract is mechanism-neutral.
 
 ```ts
-createPgb({
+createPgbase({
   database,
   anonRole: "anon",
   getSession: async (request) => {
@@ -184,7 +187,7 @@ createPgb({
 });
 ```
 
-`getSession` returns `PgbSession` (any object with a string `role`) or `null`:
+`getSession` returns `PgbaseSession` (any object with a string `role`) or `null`:
 
 | Return | Result |
 | --- | --- |
@@ -193,7 +196,7 @@ createPgb({
 | throw | the error becomes the HTTP response |
 
 Throwing is how you reject invalid/expired credentials with a specific status:
-throw a `PgbError` (e.g. `new PgbError("PGRST301", "Invalid token", 401)`), or
+throw a `PgbaseError` (e.g. `new PgbaseError("PGRST301", "Invalid token", 401)`), or
 any error carrying a numeric `status`/`statusCode` — pgbase honours it as-is. This
 matches how `auth.api.getSession` returns `null` for anonymous but throws for
 real failures.
@@ -404,7 +407,7 @@ The integration suite covers embedding (to-one/to-many/many-to-many), `!inner`, 
 - **Schema cache reload** on `NOTIFY pgrst, 'reload schema'` when `refreshOnNotify` and a `createListenClient` are provided:
 
   ```ts
-  const pgbase = createPgb({
+  const pgbase = createPgbase({
     database,
     refreshOnNotify: true,
     createListenClient: async () => {

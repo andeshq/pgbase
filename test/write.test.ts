@@ -59,7 +59,7 @@ suite("writes against Postgres", () => {
 
   const call = (path: string, init?: RequestInit) =>
     pgbase.handler(
-      new Request(`http://localhost/rest/v1${path}`, {
+      new Request(`http://localhost/rest${path}`, {
         ...init,
         headers: { "content-type": "application/json", ...(init?.headers as any) },
       }),
@@ -75,7 +75,7 @@ suite("writes against Postgres", () => {
     pgbase = createPgbase({
       database: db,
       schemaName: "write_schema",
-      basePath: "/rest/v1",
+      basePath: "/rest",
       anonRole: "anon",
       getSession: (request: Request) => {
         const sub = request.headers.get("x-sub");
@@ -98,7 +98,7 @@ suite("writes against Postgres", () => {
       headers: { prefer: "return=representation" },
     });
     expect(res.status).toBe(201);
-    expect(res.headers.get("location")).toBe("/rest/v1/books?id=eq.4");
+    expect(res.headers.get("location")).toBe("/rest/books?id=eq.4");
     expect(res.headers.get("preference-applied")).toBe("return=representation");
     const body = (await res.json()) as any[];
     expect(body[0]).toMatchObject({ id: 4, title: "New", published: true });

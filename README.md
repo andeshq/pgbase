@@ -62,18 +62,18 @@ const db = new Kysely({
 const pgbase = createPgbase({
   database: db,
   schemaName: "public",
-  basePath: "/rest/v1",
+  basePath: "/rest",
   maxRows: 1000,
 });
 
 const app = new Hono();
-app.all("/rest/v1/*", (c) => pgbase.handler(c.req.raw));
+app.all("/rest/*", (c) => pgbase.handler(c.req.raw));
 
 export default app;
 ```
 
 ```sh
-curl 'http://localhost:3000/rest/v1/books?select=title,author:authors(name)&published=eq.true&order=title.asc&limit=5'
+curl 'http://localhost:3000/rest/books?select=title,author:authors(name)&published=eq.true&order=title.asc&limit=5'
 ```
 
 Run it with `bun run app.ts` (or `bunx wrangler`/`node` with a Hono adapter).
@@ -85,7 +85,7 @@ Run it with `bun run app.ts` (or `bunx wrangler`/`node` with a Hono adapter).
 | `database` | `Kysely<DB>` | — | **Required.** Your Kysely instance. pgbase never opens its own connection. |
 | `schemaName` | `string \| string[]` | `"public"` | Exposed Postgres schema (the first entry is used until multi-schema lands). |
 | `extraSearchPath` | `string[]` | `["public"]` | Extra schemas on the request `search_path` so extensions resolve. Mirrors `db-extra-search-path`. |
-| `basePath` | `string` | `""` | Mount point, e.g. `/rest/v1`. The root route lists exposed relations. |
+| `basePath` | `string` | `""` | Mount point, e.g. `/rest`. The root route lists exposed relations. |
 | `maxRows` | `number` | `Infinity` | Hard cap applied to every read. |
 | `defaultLimit` | `number` | — | Limit used when the request omits one. |
 | `exposed` | `{ tables?: string[]; views?: string[] } \| false` | all | Allow-list of reachable relations. |
@@ -132,13 +132,13 @@ Bun.serve({ fetch: pgbase.handler });
 ```ts
 import { Hono } from "hono";
 const app = new Hono();
-app.all("/rest/v1/*", (c) => pgbase.handler(c.req.raw));
+app.all("/rest/*", (c) => pgbase.handler(c.req.raw));
 ```
 
 **Elysia**
 
 ```ts
-new Elysia().all("/rest/v1/*", ({ request }) => pgbase.handler(request));
+new Elysia().all("/rest/*", ({ request }) => pgbase.handler(request));
 ```
 
 **Next.js (App Router)**
@@ -259,7 +259,7 @@ const auth = betterAuth({
 const pgbase = createPgbase({
   database: kysely,
   schemaName: "public",
-  basePath: "/rest/v1",
+  basePath: "/rest",
   anonRole: "anon",
   getSession: async (request) => {
     const session = await auth.api.getSession({ headers: request.headers });
@@ -274,7 +274,7 @@ const pgbase = createPgbase({
 
 const app = new Hono();
 app.on(["GET", "POST"], "/api/auth/*", (c) => auth.handler(c.req.raw)); // auth
-app.all("/rest/v1/*", (c) => pgbase.handler(c.req.raw));               // pgbase
+app.all("/rest/*", (c) => pgbase.handler(c.req.raw));               // pgbase
 ```
 
 A runnable version — with RLS policies, sign-up/sign-in, and a demo UI — lives in
@@ -331,10 +331,10 @@ select=name,books(title,tags(name))   # nested
 ### Writes
 
 ```http
-POST   /rest/v1/books                    # single object or array (bulk)
-PATCH  /rest/v1/books?id=eq.1            # requires a filter
-PUT    /rest/v1/books?id=eq.1            # upsert on the primary key or ?on_conflict=
-DELETE /rest/v1/books?id=eq.1            # requires a filter
+POST   /rest/books                    # single object or array (bulk)
+PATCH  /rest/books?id=eq.1            # requires a filter
+PUT    /rest/books?id=eq.1            # upsert on the primary key or ?on_conflict=
+DELETE /rest/books?id=eq.1            # requires a filter
 
 Prefer: return=representation            # 201/200 with the affected rows
 Prefer: return=minimal                   # 204, no body (default)
@@ -345,7 +345,7 @@ Prefer: resolution=ignore-duplicates     # POST skip conflicts
 Prefer: missing=default                  # omitted columns use DEFAULT, not NULL
 Prefer: handling=strict                  # unknown columns are an error (default: drop)
 
-POST /rest/v1/books?columns=title,author_id   # vertical filtering
+POST /rest/books?columns=title,author_id   # vertical filtering
 ```
 
 - `POST` replies `201 Created` with a `Location` header pointing at the new row.
@@ -362,11 +362,11 @@ Stored functions live under `/rpc/<fn>`. Arguments can come from the JSON body
 (named), from the query string, or positionally from extra path segments.
 
 ```http
-POST /rest/v1/rpc/add              {"a": 2, "b": 3}   # -> [5]
-POST /rest/v1/rpc/add?a=2&b=3                           # query-string args
-GET  /rest/v1/rpc/add/7/8                               # positional args
-GET  /rest/v1/rpc/search_books?term=a&select=title&order=title.asc
-POST /rest/v1/rpc/search_books?select=title&published=eq.true   {"term": "a"}
+POST /rest/rpc/add              {"a": 2, "b": 3}   # -> [5]
+POST /rest/rpc/add?a=2&b=3                           # query-string args
+GET  /rest/rpc/add/7/8                               # positional args
+GET  /rest/rpc/search_books?term=a&select=title&order=title.asc
+POST /rest/rpc/search_books?select=title&published=eq.true   {"term": "a"}
 Prefer: params=bulk                [{"a":1},{"a":2}]   # -> [2,3]
 ```
 

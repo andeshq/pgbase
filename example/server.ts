@@ -13,7 +13,7 @@ const pgbase = createPgbase({
   database,
   schemaName: "public",
   extraSearchPath: ["public"],
-  basePath: "/rest/v1",
+  basePath: "/rest",
   maxRows: 1000,
   anonRole: "anon",
 
@@ -96,5 +96,5 @@ const server = createServer((req, res) => {
 
 const port = Number(process.env.PORT ?? 3000);
 server.listen(port, () => {
-  console.log(`pgbase listening on http://localhost:${port}/rest/v1`);
+  console.log(`pgbase listening on http://localhost:${port}/rest`);
 });

@@ -97,7 +97,7 @@ suite("integration against Postgres", () => {
     const config = {
       database: db,
       schemaName: "read_schema",
-      basePath: "/rest/v1",
+      basePath: "/rest",
       anonRole: "anon",
       getSession: (request: Request) => {
         const sub = request.headers.get("x-sub");
@@ -120,7 +120,7 @@ suite("integration against Postgres", () => {
   });
 
   const call = (path: string, init?: RequestInit) =>
-    pgbase.handler(new Request(`http://localhost/rest/v1${path}`, init as any));
+    pgbase.handler(new Request(`http://localhost/rest${path}`, init as any));
 
   test("to-many embedding", async () => {
     const res = await call("/authors?select=name,books(title)&order=name.asc");
@@ -289,7 +289,7 @@ suite("integration against Postgres", () => {
   });
 
   test("maxRows caps the result", async () => {
-    const res = await capped.handler(new Request("http://localhost/rest/v1/books?select=id&order=id.asc"));
+    const res = await capped.handler(new Request("http://localhost/rest/books?select=id&order=id.asc"));
     expect(((await res.json()) as any[]).map((b: any) => b.id)).toEqual([1, 2]);
   });
 

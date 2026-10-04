@@ -127,7 +127,7 @@ export interface PgbaseSession {
    */
   extraSearchPath?: string[];
   /**
-   * Mount point when attached to a larger router, e.g. `/rest/v1`.
+   * Mount point when attached to a larger router, e.g. `/rest`.
    * Defaults to the root (`""`), matching PostgREST.
    */
   basePath?: string;

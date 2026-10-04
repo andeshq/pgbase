@@ -3,7 +3,7 @@
  *
  * One Hono app serves three things:
  *   1. Better Auth's own endpoints   (/api/auth/*)
- *   2. pgbase's PostgREST API        (/rest/v1/*)
+ *   2. pgbase's PostgREST API        (/rest/*)
  *   3. A tiny demo UI                (/)
  *
  * Better Auth owns authentication (sign-up/sign-in, sessions, cookies). pgbase
@@ -71,7 +71,7 @@ export const pgbase = createPgbase({
   database,
   schemaName: "public",
   extraSearchPath: ["public"],
-  basePath: "/rest/v1",
+  basePath: "/rest",
   maxRows: 1000,
   anonRole: "anon",
 
@@ -100,7 +100,7 @@ export const app = new Hono();
 app.on(["GET", "POST"], "/api/auth/*", (c) => auth.handler(c.req.raw));
 
 // 2. pgbase's PostgREST API.
-app.all("/rest/v1/*", (c) => pgbase.handler(c.req.raw));
+app.all("/rest/*", (c) => pgbase.handler(c.req.raw));
 
 // 3. A tiny demo UI so you can drive it from the browser.
 app.get("/", (c) =>
@@ -111,7 +111,7 @@ app.get("/", (c) =>
     <h1>pgbase + Better Auth</h1>
     <p>Cookie-based session, resolved server-side for pgbase.</p>
     <button onclick="signIn()">Sign in (demo user)</button>
-    <button onclick="load()">GET /rest/v1/todos</button>
+    <button onclick="load()">GET /rest/todos</button>
     <pre id="out"></pre>
     <script>
       const out = (x) => document.getElementById("out").textContent =
@@ -135,7 +135,7 @@ app.get("/", (c) =>
       }
 
       async function load() {
-        const res = await fetch("/rest/v1/todos?select=*");
+        const res = await fetch("/rest/todos?select=*");
         out({ status: res.status, body: await res.json() });
       }
     </script>
@@ -155,5 +155,5 @@ if (process.argv[2] === "migrate") {
 serve({ fetch: app.fetch, port }, (info) => {
   console.log(`http://localhost:${info.port}`);
   console.log(`  auth    http://localhost:${info.port}/api/auth/*`);
-  console.log(`  pgbase  http://localhost:${info.port}/rest/v1/*`);
+  console.log(`  pgbase  http://localhost:${info.port}/rest/*`);
 });

@@ -1,0 +1,36 @@
+{
+  "name": "pgb",
+  "version": "0.1.0",
+  "description": "Composable, configurable PostgREST-compatible API for Kysely, on Node",
+  "type": "module",
+  "engines": {
+    "node": ">=22.6"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/andeshq/pgb.git"
+  },
+  "scripts": {
+    "test": "node --test 'test/**/*.test.ts'",
+    "test:unit": "node --test 'test/parse.test.ts' 'test/compile.test.ts'",
+    "typecheck": "tsc --noEmit",
+    "example": "node example/server.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^26",
+    "@types/pg": "^8",
+    "kysely": "^0.29",
+    "pg": "^8",
+    "typescript": "^7"
+  },
+  "peerDependencies": {
+    "kysely": ">=0.27"
+  }
+}

@@ -164,6 +164,9 @@ export function createPgbase<DB = unknown>(config: PgbaseConfig<DB>): Pgbase<DB>
 
   const handler = async (request: Request): Promise<Response> => {
     const url = new URL(request.url);
+    // Whether the request resolved to a non-anonymous session. Drives the
+    // PostgREST 42501 mapping (403 when authenticated, 401 otherwise).
+    let authenticated = false;
     try {
       // The request hook is a cheap gate: it runs before schema introspection.
       const hook = await config.onRequest?.(request);
@@ -187,6 +190,7 @@ export function createPgbase<DB = unknown>(config: PgbaseConfig<DB>): Pgbase<DB>
       // Resolve the session once, before any transaction, so auth never holds a
       // pooled connection. Throws (e.g. invalid token) fall through to onError.
       const session = await resolveSession(runtime, request, ctx);
+      authenticated = session !== null;
 
       // RPC: /rpc/<fn>[/<positional args...>]
       if (rest === "rpc" || rest.startsWith("rpc/")) {
@@ -211,7 +215,7 @@ export function createPgbase<DB = unknown>(config: PgbaseConfig<DB>): Pgbase<DB>
         const custom = await config.onError(error);
         if (custom) return custom;
       }
-      return errorResponse(error, runtime.verbosity);
+      return errorResponse(error, runtime.verbosity, authenticated);
     }
   };
 

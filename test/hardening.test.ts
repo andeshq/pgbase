@@ -32,6 +32,11 @@ insert into items (name) values ('a'), ('b'), ('c');
 grant select, insert, update, delete on all tables in schema hard to anon, authenticated;
 grant usage, select on all sequences in schema hard to anon, authenticated;
 
+-- A table the authenticated role has no privileges on, to exercise the
+-- insufficient_privilege (42501) mapping. Created after the blanket grant.
+create table locked (id serial primary key, name text not null);
+grant select on locked to anon;
+
 create function many_rows(n int) returns setof items language sql stable as $$
   select i.* from items i, generate_series(1, n)
 $$;
@@ -160,6 +165,19 @@ suite("hardening: tier 1 + 2", () => {
     const noSession = createPgbase({ ...base, getSession: undefined } as any);
     const res = await call("/items?select=name", {}, noSession);
     expect(res.status).toBe(200);
+  });
+
+  // -- PostgREST 42501 mapping (insufficient_privilege) ----------------------
+  test("42501 is 403 for authenticated and 401 for anon", async () => {
+    // `authenticated` (the default session) has no privileges on `locked`.
+    const authed = await call("/locked", { method: "POST", body: JSON.stringify({ name: "x" }) });
+    expect(authed.status).toBe(403);
+    expect(((await authed.json()) as any).code).toBe("42501");
+
+    const anon = createPgbase({ ...base, getSession: undefined } as any);
+    const anonRes = await call("/locked", { method: "POST", body: JSON.stringify({ name: "x" }) }, anon);
+    expect(anonRes.status).toBe(401);
+    expect(((await anonRes.json()) as any).code).toBe("42501");
   });
 
   // -- Tier 1.4: identifier injection ----------------------------------------

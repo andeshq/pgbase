@@ -401,6 +401,12 @@ Responses always include a PostgREST-style `Content-Range`. A `Range` request re
 { "code": "PGRST205", "details": null, "hint": null, "message": "Could not find the table 'nope' in the schema cache" }
 ```
 
+Postgres errors are mapped to HTTP the way PostgREST does it. Notably, `42501`
+(insufficient privilege) is **403 when the request is authenticated and 401
+otherwise**, and the `0L*`/`0P*`/`28*` classes map to 403. The SQLSTATE is read
+from whichever field the driver uses — `code` for `pg`/`postgres.js`, `errno` for
+Bun SQL — so a denied write surfaces as 401/403 rather than a generic 500.
+
 ## Testing
 
 Tests run on the Node built-in test runner (`node:test`) with native TypeScript

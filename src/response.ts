@@ -57,8 +57,10 @@ function toCsv(rows: any[]): string {
 export function errorResponse(
   error: unknown,
   verbosity: "verbose" | "minimal" = "verbose",
+  authenticated = false,
 ): Response {
-  const pgbError = error instanceof PgbaseError ? error : fromPostgresError(error, verbosity);
+  const pgbError =
+    error instanceof PgbaseError ? error : fromPostgresError(error, verbosity, authenticated);
   const headers = new Headers(pgbError.headers ?? {});
   headers.set("Content-Type", "application/json; charset=utf-8");
   return new Response(JSON.stringify(pgbError.toJSON()), {

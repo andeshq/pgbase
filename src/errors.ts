@@ -152,7 +152,7 @@ const PG_STATUS: Record<string, number> = {
   "22003": 400, // numeric_value_out_of_range
   "42703": 400, // undefined_column
   "42P01": 404, // undefined_table
-  "42501": 401, // insufficient_privilege
+  "42501": 401, // insufficient_privilege (role-aware in fromPostgresError: 403 if authenticated)
   "42883": 404, // undefined_function
   "42P17": 500, // invalid_object_definition
   "40001": 500, // serialization_failure
@@ -164,6 +164,10 @@ const PG_STATUS: Record<string, number> = {
 function statusForPgCode(code: string): number {
   const direct = PG_STATUS[code];
   if (direct !== undefined) return direct;
+  // Classes PostgREST maps to 403 (see its "Errors from PostgreSQL" table).
+  if (code.startsWith("0L")) return 403; // invalid_grantor
+  if (code.startsWith("0P")) return 403; // invalid_role_specification
+  if (code.startsWith("28")) return 403; // invalid_authorization_specification
   if (code.startsWith("22")) return 400;
   if (code.startsWith("23")) return 409;
   if (code.startsWith("42")) return 400;
@@ -172,11 +176,33 @@ function statusForPgCode(code: string): number {
   return 500;
 }
 
+/** SQLSTATEs are 5 chars, uppercase letters and digits (e.g. `42501`, `22P02`, `P0001`). */
+const SQLSTATE = /^[0-9A-Z]{5}$/;
+
+/**
+ * Extract the Postgres SQLSTATE from a driver error, wherever it lives.
+ *
+ * Drivers disagree: node-postgres and postgres.js put it in `code`, while Bun SQL
+ * sets `code` to a generic `ERR_POSTGRES_SERVER_ERROR` and puts the SQLSTATE in
+ * `errno`. Accept any of `code`/`errno`/`sqlState` that looks like a SQLSTATE,
+ * so a denied write maps to 401/403 instead of falling through to a 500.
+ */
+function sqlStateOf(error: { code?: unknown; errno?: unknown; sqlState?: unknown }): string | undefined {
+  for (const candidate of [error.code, error.errno, error.sqlState]) {
+    if (typeof candidate === "string" && SQLSTATE.test(candidate)) return candidate;
+  }
+  return undefined;
+}
+
 /**
  * Convert any thrown value into a PostgREST-shaped error. `verbosity` controls
  * whether `details`/`hint` are preserved ("verbose") or dropped ("minimal").
  */
-export function fromPostgresError(error: unknown, verbosity: "verbose" | "minimal" = "verbose"): PgbaseError {
+export function fromPostgresError(
+  error: unknown,
+  verbosity: "verbose" | "minimal" = "verbose",
+  authenticated = false,
+): PgbaseError {
   if (error instanceof PgbaseError) return error;
 
   // A thrown error carrying a numeric HTTP status (e.g. a framework's
@@ -195,21 +221,37 @@ export function fromPostgresError(error: unknown, verbosity: "verbose" | "minima
 
   const err = error as {
     code?: unknown;
+    errno?: unknown;
+    sqlState?: unknown;
     message?: unknown;
     detail?: unknown;
     hint?: unknown;
   };
-  const code = typeof err?.code === "string" ? err.code : undefined;
   const message = typeof err?.message === "string" ? err.message : "Internal Server Error";
   const exposeDetail = verbosity === "verbose";
   const details = exposeDetail && typeof err?.detail === "string" ? err.detail : null;
   const hint = exposeDetail && typeof err?.hint === "string" ? err.hint : null;
-  if (!code) return new PgbaseError("PGRST500", message, 500, details, hint);
-  // 42501 covers both "permission denied" and RLS `with check` violations.
-  if (code === "42501" && /row-level security/i.test(message)) {
-    return new PgbaseError(code, message, 403, details, hint);
+
+  const sqlState = sqlStateOf(err);
+
+  // No SQLSTATE: some drivers/edge runtimes wrap the server error and drop it.
+  // If it still reads like a privilege denial, map it rather than returning 500.
+  if (!sqlState) {
+    if (/permission denied|insufficient privilege/i.test(message)) {
+      const denied = authenticated ? 403 : 401;
+      return new PgbaseError(pgbCodeForStatus(denied), message, denied, details, hint);
+    }
+    return new PgbaseError("PGRST500", message, 500, details, hint);
   }
-  return new PgbaseError(code, message, statusForPgCode(code), details, hint);
+
+  // 42501 (insufficient_privilege) covers both "permission denied" and RLS
+  // `with check` violations. PostgREST maps it to 403 when authenticated, else
+  // 401, so an authenticated caller denied on a write gets 403 rather than 401.
+  if (sqlState === "42501") {
+    return new PgbaseError(sqlState, message, authenticated ? 403 : 401, details, hint);
+  }
+
+  return new PgbaseError(sqlState, message, statusForPgCode(sqlState), details, hint);
 }
 
 /** Read a numeric HTTP status from a thrown error, if it carries one. */

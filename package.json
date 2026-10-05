@@ -19,7 +19,7 @@
   },
   "scripts": {
     "test": "node --test 'test/**/*.test.ts'",
-    "test:unit": "node --test 'test/parse.test.ts' 'test/compile.test.ts'",
+    "test:unit": "node --test 'test/parse.test.ts' 'test/compile.test.ts' 'test/errors.test.ts'",
     "typecheck": "tsc --noEmit",
     "example": "node example/server.ts",
     "example:auth": "bun run example/better-auth-hono.ts"

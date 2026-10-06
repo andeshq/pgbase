@@ -9,11 +9,16 @@ import type {
   PgbaseSchema,
 } from "../types.ts";
 import { PgbaseError } from "../errors.ts";
+import { inferViewForeignKeys } from "./view-relations.ts";
 
 interface RelationRow {
   name: string;
   kind: string;
   oid: number;
+  insertable: boolean;
+  updatable: boolean;
+  deletable: boolean;
+  view_definition: string | null;
 }
 
 interface ColumnRow {
@@ -107,7 +112,13 @@ export async function introspect(
   exposed: PgbaseExposed | false | undefined,
 ): Promise<PgbaseSchema> {
   const relationRows = await sql<RelationRow>`
-    select c.relname as name, c.relkind as kind, c.oid as oid
+    select c.relname as name,
+           c.relkind as kind,
+           c.oid as oid,
+           (pg_relation_is_updatable(c.oid, true) & 8) <> 0 as insertable,
+           (pg_relation_is_updatable(c.oid, true) & 4) <> 0 as updatable,
+           (pg_relation_is_updatable(c.oid, true) & 16) <> 0 as deletable,
+           case when c.relkind in ('v', 'm') then pg_get_viewdef(c.oid, true) end as view_definition
     from pg_class c
     join pg_namespace n on n.oid = c.relnamespace
     where n.nspname = ${schemaName}
@@ -192,12 +203,19 @@ export async function introspect(
 
   // Group key constraints preserving column order.
   const pkByTable = new Map<string, string[]>();
-  const uniqueByTable = new Map<string, string[]>();
+  const uniqueByTable = new Map<string, Map<string, string[]>>();
   for (const row of keyRows.rows) {
-    const map = row.contype === "p" ? pkByTable : uniqueByTable;
-    const list = map.get(row.table_name) ?? [];
-    list.push(row.column_name);
-    map.set(row.table_name, list);
+    if (row.contype === "p") {
+      const list = pkByTable.get(row.table_name) ?? [];
+      list.push(row.column_name);
+      pkByTable.set(row.table_name, list);
+      continue;
+    }
+    const constraints = uniqueByTable.get(row.table_name) ?? new Map<string, string[]>();
+    const columns = constraints.get(row.constraint_name) ?? [];
+    columns.push(row.column_name);
+    constraints.set(row.constraint_name, columns);
+    uniqueByTable.set(row.table_name, constraints);
   }
 
   const foreignKeys: PgbaseForeignKey[] = [];
@@ -229,13 +247,26 @@ export async function introspect(
       name: row.name,
       schema: schemaName,
       kind,
+      ...(kind === "view" || kind === "materialized_view"
+        ? { insertable: row.insertable, updatable: row.updatable, deletable: row.deletable }
+        : {}),
       columns,
       columnMap: new Map(columns.map((c) => [c.name, c])),
       primaryKey: pkByTable.get(row.name) ?? null,
-      uniques: uniqueByTable.has(row.name) ? [uniqueByTable.get(row.name)!] : [],
+      uniques: [...(uniqueByTable.get(row.name)?.values() ?? [])],
     });
   }
   for (const relation of relations) tables.set(relation.name, relation);
+
+  foreignKeys.push(
+    ...inferViewForeignKeys(
+      relationRows.rows
+        .filter((row) => row.kind === "v" || row.kind === "m")
+        .map((row) => ({ name: row.name, definition: row.view_definition })),
+      columnsByTable,
+      foreignKeys,
+    ),
+  );
 
   const functions = await introspectFunctions(db, schemaName);
 

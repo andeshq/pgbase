@@ -89,6 +89,7 @@ Run it with `bun run app.ts` (or `bunx wrangler`/`node` with a Hono adapter).
 | `maxRows` | `number` | `1000` | Hard cap applied to reads and set-returning RPCs. Set `Infinity` to disable. |
 | `defaultLimit` | `number` | — | Limit used when the request omits one. |
 | `exposed` | `{ tables?: string[]; views?: string[] } \| false` | all | Allow-list of reachable relations. |
+| `allowUnfilteredViewWrites` | `boolean` | `false` | Permit unfiltered `PATCH`/`DELETE` on updatable views. |
 | `anonRole` | `string` | — | Role used when `getSession` returns `null`. Mirrors `db-anon-role`. |
 | `allowConnectionRole` | `boolean` | `false` | Acknowledge that role-less requests run as the connection role (silences the startup warning). |
 | `maxBodyBytes` | `number` | `1048576` | Reject request bodies larger than this with `413`. |
@@ -334,7 +335,11 @@ select=*,books(title,published)
 select=author:authors!author_id(name)
 select=name,books!inner(title)        # inner embed also filters parents
 select=name,books(title,tags(name))   # nested
+select=title,...author:authors(name)  # flatten a to-one embed into the row
 ```
+
+Spread embeds currently support to-one relationships and scalar child columns;
+to-many or nested spread requests are rejected rather than silently reshaped.
 
 ### Filter operators
 
@@ -379,13 +384,40 @@ Prefer: handling=strict                  # unknown columns are an error (default
 POST /rest/books?columns=title,author_id   # vertical filtering
 ```
 
+`POST` also accepts nested related objects/arrays. pgbase inserts the related
+rows, propagates FK values, and inserts junction rows in the same transaction:
+
+```json
+{
+  "name": "Ada",
+  "books": [{ "title": "A book" }, { "title": "Another book" }]
+}
+```
+
+The relation keys in the body use table names (not response aliases). Nested
+`POST` supports to-one, to-many, and many-to-many relationships and requires a
+primary key on the parent. It currently rejects `columns`, `on_conflict`, and
+conflict-resolution preferences with nested bodies. Nested `PATCH`/`PUT` is not
+implemented.
+
 - `POST` replies `201 Created` with a `Location` header pointing at the new row.
 - `PUT` replies `201` when it inserted and `200` when it updated.
-- `PATCH`/`DELETE` without a filter are rejected on real tables.
+- Unfiltered `PATCH`/`DELETE` are rejected by default for tables and views;
+  explicitly set `allowUnfilteredViewWrites: true` only when a view is safe to sweep.
 - `Prefer: return=representation` re-reads embedded/many-to-many results, or uses a
   single-statement `RETURNING` when no correlated embed is involved.
 - Requesting a representation on a `PATCH`/`PUT`/`DELETE` as the `anon` role that
   matched zero rows returns `401`, mirroring PostgREST.
+
+### Views
+
+Views and materialized views support reads and appear in the root relation list.
+PostgreSQL updatable views support writes according to their view rules and
+privileges; non-updatable views and materialized views are rejected with `405`.
+Simple direct-column view projections (including chains and joins with projected
+FK columns) can inherit relationships for embedding. `UNION` views and complex
+expressions are deliberately not guessed. PK-less views can return ordinary
+write representations, but embedded write representations require a primary key.
 
 ### RPC
 
@@ -474,7 +506,7 @@ The integration suite covers embedding (to-one/to-many/many-to-many), `!inner`, 
 ## Hardening
 
 - **`maxRows` also caps RPC** `SETOF` results, and `Prefer: count=exact` on RPC returns a real count.
-- **Unfiltered `PATCH`/`DELETE` on base tables is rejected** (views are exempt — they need `INSTEAD OF` triggers to be writable).
+- **Unfiltered `PATCH`/`DELETE` is rejected** by default, including on views. Updatable views can opt in with `allowUnfilteredViewWrites: true`.
 - **Request bodies are size-limited** (`maxBodyBytes`, default 1 MiB) and rejected with `413` before being processed, whether or not `Content-Length` is present.
 - **`errorVerbosity: "minimal"`** suppresses Postgres `details`/`hint`, which can contain row values.
 - **`settings`** applies transaction-scoped Postgres settings (e.g. `statement_timeout`) to every request.
@@ -503,3 +535,4 @@ The integration suite covers embedding (to-one/to-many/many-to-many), `!inner`, 
 - OpenAPI document at the service root.
 - Function overloading by argument type (`/rpc/fn` resolves by name only, so
   same-name overloads are not disambiguated).
+- Nested `PATCH`/`PUT`; nested writes are currently `POST` only.

@@ -3,6 +3,8 @@ import type { FilterNode, ParsedMutation, SelectNode } from "../ast.ts";
 import { PgbaseError, DEFAULT } from "../errors.ts";
 import { buildSelectionList, resolveLevel, type ExecContext } from "./compile.ts";
 import { renderFilter, type QueryLevel } from "./filters.ts";
+import { resolveRelationship, type Relationship } from "../schema/index.ts";
+import type { PgbaseRelation } from "../types.ts";
 import { INSERTED_ALIAS, keyAlias, KEY_PREFIX, AFFECTED_ALIAS } from "./aliases.ts";
 
 export interface WriteContext extends ExecContext {
@@ -26,6 +28,7 @@ type Level = QueryLevel;
 
 export async function executeMutation(ctx: WriteContext): Promise<MutationResult> {
   const level = resolveLevel(ctx.schema, ctx.mutation.table);
+  assertWritableRelation(level, ctx.mutation.method);
   switch (ctx.mutation.method) {
     case "POST":
       return executeInsert(ctx, level);
@@ -36,6 +39,25 @@ export async function executeMutation(ctx: WriteContext): Promise<MutationResult
     case "DELETE":
       return executeDelete(ctx, level);
   }
+}
+
+function assertWritableRelation(level: Level, method: string): void {
+  if (level.relation.kind === "materialized_view") {
+    throw PgbaseError.relationNotWritable(level.relation.name, method);
+  }
+  if (level.relation.kind !== "view") return;
+
+  // PostgreSQL views support INSERT/UPDATE/DELETE independently. ON CONFLICT
+  // (pgbase's PUT semantics) requires a real table/index and is never valid on
+  // a view, even when the view is otherwise auto-updatable.
+  const writable = method === "POST"
+    ? level.relation.insertable
+    : method === "PATCH"
+      ? level.relation.updatable
+      : method === "DELETE"
+        ? level.relation.deletable
+        : false;
+  if (!writable) throw PgbaseError.relationNotWritable(level.relation.name, method);
 }
 
 // ---------------------------------------------------------------------------
@@ -139,17 +161,22 @@ function primaryKeyPredicate(level: Level, keys: any[]): any {
   return (eb: any) => eb.or(keys.map((key: any) => eb.and(pk.map((column) => eb(column, "=", key[column])))));
 }
 
-function requirePrimaryKey(level: Level): string[] {
+function requirePrimaryKey(level: Level, message = "Cannot embed: relation has no primary key"): string[] {
   const pk = level.relation.primaryKey;
-  if (!pk || pk.length === 0) throw PgbaseError.relationshipEmpty("Cannot embed: table has no primary key");
+  if (!pk || pk.length === 0) throw PgbaseError.relationshipEmpty(message);
   return pk;
 }
 
-async function reReadByKeys(ctx: WriteContext, level: Level, keys: any[]): Promise<any[]> {
+async function reReadByKeys(
+  ctx: WriteContext,
+  level: Level,
+  keys: any[],
+  keyColumns: string[] = requirePrimaryKey(level),
+): Promise<any[]> {
   return ctx.db
     .selectFrom(level.name)
     .select(returningClause(ctx, level) as any)
-    .where(primaryKeyPredicate(level, keys))
+    .where((eb: any) => eb.or(keys.map((key: any) => eb.and(keyColumns.map((column) => eb(column, "=", key[column]))))))
     .execute();
 }
 
@@ -158,13 +185,15 @@ async function selectKeys(ctx: WriteContext, level: Level, filters: FilterNode[]
   return applyFilters(level, ctx.db.selectFrom(level.name).select(pk), filters).execute();
 }
 
-/**
- * Reject an unfiltered PATCH/DELETE on a base table (views are exempt: they
- * require INSTEAD OF triggers to be writable and may intentionally sweep).
- */
-function assertFilteredForWrite(level: Level, filters: FilterNode[], method: string): void {
-  const isView = level.relation.kind === "view" || level.relation.kind === "materialized_view";
-  if (filters.length === 0 && !isView) {
+/** Reject unfiltered PATCH/DELETE unless an updatable view is explicitly opted in. */
+function assertFilteredForWrite(
+  level: Level,
+  filters: FilterNode[],
+  method: string,
+  allowUnfilteredViewWrites: boolean,
+): void {
+  const isView = level.relation.kind === "view";
+  if (filters.length === 0 && !(isView && allowUnfilteredViewWrites)) {
     throw PgbaseError.parse(`${method} requires a filter to avoid modifying every row`);
   }
 }
@@ -201,10 +230,37 @@ async function executeInsert(ctx: WriteContext, level: Level): Promise<MutationR
   const bodyRows = await readBodyRows(ctx);
   if (bodyRows.length === 0) throw PgbaseError.parse("The request body is empty");
 
+  const hasNestedBody = bodyRows.some((row) =>
+    Object.entries(row).some(([key, value]) => {
+      const name = key.trim();
+      const hasColumn = level.relation.columnMap.has(name);
+      return ctx.schema.tables.has(name) && (!hasColumn || looksLikeNestedValue(value));
+    }),
+  );
+  if (hasNestedBody) {
+    if (ctx.mutation.columns || ctx.mutation.onConflict || ctx.mutation.prefer.resolution) {
+      throw PgbaseError.parse("Nested POST does not support `columns`, `on_conflict`, or conflict resolution");
+    }
+    const pk = requirePrimaryKey(level, "Nested POST requires a primary key on the parent relation");
+    const keys: Array<Record<string, unknown>> = [];
+    for (const row of bodyRows) {
+      const inserted = await insertNestedRow(ctx, level, row, pk, 0);
+      keys.push(pick(inserted, pk));
+    }
+    const responseRows = wantsRepresentation(ctx) ? await reReadByKeys(ctx, level, keys) : [];
+    return shape(ctx, responseRows, keys, keys.length);
+  }
+
   const dropped = new Set<string>();
   const rows = bodyRows.map((row) => renderValues(reconcileRow(ctx, level, row, dropped)));
   const pk = level.relation.primaryKey;
-  const returnKeys = pk ?? ["*"];
+  const returnKeys = pk ?? level.relation.columns.map((column) => column.name);
+
+  if (wantsRepresentation(ctx) && needsReRead(ctx.mutation.select) && !pk) {
+    throw PgbaseError.relationshipEmpty(
+      `Cannot return embedded representation for '${level.relation.name}' without a primary key`,
+    );
+  }
 
   let qb: any = ctx.db.insertInto(level.name).values(rows);
   qb = applyConflict(ctx, qb);
@@ -215,11 +271,20 @@ async function executeInsert(ctx: WriteContext, level: Level): Promise<MutationR
   }
 
   if (!wantsRepresentation(ctx)) {
+    if (!pk) {
+      const result = await qb.executeTakeFirst();
+      return shape(ctx, [], undefined, affectedRows(result));
+    }
     const result = await qb.returning(returnKeys).execute();
     return shape(ctx, [], result, result.length);
   }
 
   if (needsReRead(ctx.mutation.select)) {
+    if (!pk) {
+      throw PgbaseError.relationshipEmpty(
+        `Cannot return embedded representation for '${level.relation.name}' without a primary key`,
+      );
+    }
     const inserted = await qb.returning(returnKeys).execute();
     const responseRows = inserted.length > 0 ? await reReadByKeys(ctx, level, inserted) : [];
     return shape(ctx, responseRows, inserted, inserted.length);
@@ -227,6 +292,199 @@ async function executeInsert(ctx: WriteContext, level: Level): Promise<MutationR
 
   const result = await qb.returning(returningClause(ctx, level)).execute();
   return shape(ctx, result, pk ? result.map((row: any) => pick(row, pk)) : undefined, result.length);
+}
+
+interface NestedBodyField {
+  relation: PgbaseRelation;
+  relationship: Relationship;
+  parentOwnsForeignKey: boolean;
+  value: unknown;
+}
+
+function parentOwnsForeignKey(
+  ctx: WriteContext,
+  parent: PgbaseRelation,
+  related: PgbaseRelation,
+  relationship: Relationship,
+): boolean {
+  return relationship.kind === "one" && ctx.schema.foreignKeys.some((fk) =>
+    fk.fromTable === parent.name &&
+    fk.toTable === related.name &&
+    fk.fromColumns.length === relationship.parentColumns.length &&
+    fk.fromColumns.every((column, index) => column === relationship.parentColumns[index]) &&
+    fk.toColumns.every((column, index) => column === relationship.relatedColumns[index]),
+  );
+}
+
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function looksLikeNestedValue(value: unknown): boolean {
+  return isJsonObject(value) || (Array.isArray(value) && value.length > 0 && value.every(isJsonObject));
+}
+
+function splitNestedBody(
+  ctx: WriteContext,
+  level: Level,
+  body: Record<string, unknown>,
+  dropped: Set<string>,
+): { row: Record<string, unknown>; nested: NestedBodyField[] } {
+  const row: Record<string, unknown> = {};
+  const nested: NestedBodyField[] = [];
+
+  for (const [rawName, value] of Object.entries(body)) {
+    const name = rawName.trim();
+    const hasColumn = level.relation.columnMap.has(name);
+    const related = ctx.schema.tables.get(name);
+    if (hasColumn && related && looksLikeNestedValue(value)) {
+      throw PgbaseError.parse(`Nested body key '${name}' conflicts with a column of the same name`);
+    }
+    if (hasColumn) {
+      row[name] = value;
+      continue;
+    }
+
+    if (related) {
+      const relationship = resolveRelationship(ctx.schema, level.relation, related);
+      const parentOwnsFk = parentOwnsForeignKey(ctx, level.relation, related, relationship);
+      if (relationship.kind === "one") {
+        if (value !== null && !isJsonObject(value)) {
+          throw PgbaseError.parse(`Nested to-one relation '${name}' must be a JSON object or null`);
+        }
+      } else if (!Array.isArray(value) || !value.every(isJsonObject)) {
+        throw PgbaseError.parse(`Nested to-many relation '${name}' must be an array of JSON objects`);
+      }
+      nested.push({ relation: related, relationship, parentOwnsForeignKey: parentOwnsFk, value });
+      continue;
+    }
+
+    if (ctx.mutation.prefer.handling === "strict") {
+      throw PgbaseError.columnNotFound(name, level.relation.name);
+    }
+    dropped.add(name);
+  }
+
+  return { row, nested };
+}
+
+function assignForeignKeys(
+  row: Record<string, unknown>,
+  rowColumns: string[],
+  source: Record<string, unknown>,
+  sourceColumns: string[],
+): void {
+  rowColumns.forEach((column, index) => {
+    const value = source[sourceColumns[index]!];
+    if (value === undefined) {
+      throw PgbaseError.parse(`Could not resolve nested relationship column '${sourceColumns[index]}'`);
+    }
+    const existing = row[column];
+    if (existing !== undefined && existing !== DEFAULT && String(existing) !== String(value)) {
+      throw PgbaseError.parse(`Nested relationship conflicts with supplied '${column}' value`);
+    }
+    row[column] = value;
+  });
+}
+
+/** Insert one row and its nested POST relations within the caller's transaction. */
+async function insertNestedRow(
+  ctx: WriteContext,
+  level: Level,
+  body: Record<string, unknown>,
+  requiredColumns: string[],
+  depth: number,
+): Promise<Record<string, unknown>> {
+  if (depth > 32) throw PgbaseError.parse("Nested POST exceeds the maximum relation depth of 32");
+
+  const dropped = new Set<string>();
+  const { row: inputRow, nested } = splitNestedBody(ctx, level, body, dropped);
+  if (nested.length > 0 && ctx.mutation.columns) {
+    throw PgbaseError.parse("Nested POST cannot be combined with `columns`");
+  }
+
+  // Parent-side foreign keys must be populated before their row is inserted.
+  for (const field of nested) {
+    if (field.relationship.kind !== "one" || !field.parentOwnsForeignKey) continue;
+    if (field.value === null) {
+      assignForeignKeys(
+        inputRow,
+        field.relationship.parentColumns,
+        Object.fromEntries(field.relationship.relatedColumns.map((column) => [column, null])),
+        field.relationship.relatedColumns,
+      );
+      continue;
+    }
+    const relatedLevel = resolveLevel(ctx.schema, field.relation.name);
+    const relatedRow = await insertNestedRow(
+      ctx,
+      relatedLevel,
+      field.value as Record<string, unknown>,
+      field.relationship.relatedColumns,
+      depth + 1,
+    );
+    assignForeignKeys(inputRow, field.relationship.parentColumns, relatedRow, field.relationship.relatedColumns);
+  }
+
+  const row = reconcileRow(ctx, level, inputRow, dropped);
+  const returnColumns = new Set(requiredColumns);
+  for (const field of nested) {
+    if (field.relationship.kind !== "one" || !field.parentOwnsForeignKey) {
+      field.relationship.parentColumns.forEach((column) => returnColumns.add(column));
+    }
+  }
+
+  let insert: any = ctx.db.insertInto(level.name).values(renderValues(row));
+  let inserted: Record<string, unknown> | undefined;
+  if (returnColumns.size > 0) {
+    inserted = await insert.returning([...returnColumns]).executeTakeFirst();
+  } else {
+    await insert.executeTakeFirst();
+    inserted = {};
+  }
+  if (!inserted) throw PgbaseError.parse(`Nested insert into '${level.relation.name}' did not return a row`);
+
+  // Child rows depend on the now-known parent foreign-key values.
+  for (const field of nested) {
+    const relationship = field.relationship;
+    if (relationship.kind === "one" && field.parentOwnsForeignKey) continue;
+    if (relationship.kind === "one" && field.value === null) continue;
+
+    const childBodies = relationship.kind === "one"
+      ? [field.value as Record<string, unknown>]
+      : field.value as Array<Record<string, unknown>>;
+    for (const childBody of childBodies) {
+      const child = { ...childBody };
+      assignForeignKeys(child, relationship.relatedColumns, inserted, relationship.parentColumns);
+      const relatedLevel = resolveLevel(ctx.schema, field.relation.name);
+      const relatedRow = await insertNestedRow(
+        ctx,
+        relatedLevel,
+        child,
+        relationship.kind === "many-to-many" ? relationship.relatedColumns : [],
+        depth + 1,
+      );
+
+      if (relationship.kind === "many-to-many") {
+        const junctionRow: Record<string, unknown> = {};
+        assignForeignKeys(
+          junctionRow,
+          relationship.junctionParentColumns,
+          inserted,
+          relationship.parentColumns,
+        );
+        assignForeignKeys(
+          junctionRow,
+          relationship.junctionRelatedColumns,
+          relatedRow,
+          relationship.relatedColumns,
+        );
+        await ctx.db.insertInto(relationship.junction).values(junctionRow).executeTakeFirst();
+      }
+    }
+  }
+
+  return inserted;
 }
 
 function pick(row: Record<string, unknown>, columns: string[]): Record<string, unknown> {
@@ -249,7 +507,7 @@ async function executeUpdate(ctx: WriteContext, level: Level): Promise<MutationR
   const filters = ctx.mutation.filters;
 
   if (Object.keys(changes).length === 0) return shape(ctx, [], undefined, 0);
-  assertFilteredForWrite(level, filters, "PATCH");
+  assertFilteredForWrite(level, filters, "PATCH", ctx.allowUnfilteredViewWrites);
 
   if (!wantsRepresentation(ctx)) {
     const result = await applyFilters(level, ctx.db.updateTable(level.name).set(renderValues(changes)), filters)
@@ -258,6 +516,7 @@ async function executeUpdate(ctx: WriteContext, level: Level): Promise<MutationR
   }
 
   if (wantsRepresentation(ctx) && needsReRead(ctx.mutation.select)) {
+    requirePrimaryKey(level, `Cannot return embedded representation for '${level.relation.name}' without a primary key`);
     const keys = await selectKeys(ctx, level, filters);
     if (keys.length === 0) return shape(ctx, [], undefined, 0);
     let update: any = ctx.db.updateTable(level.name).set(renderValues(changes));
@@ -360,7 +619,9 @@ async function executeUpsert(ctx: WriteContext, level: Level): Promise<MutationR
     const result = await qb.returning(returnKeysAndInserted).execute();
     const inserted = result.length > 0 ? result[0][INSERTED_ALIAS] === true : false;
     const keys = result.map((row: any) => pick(row, pk));
-    const rows = needsReRead(ctx.mutation.select) && keys.length > 0 ? await reReadByKeys(ctx, level, keys) : [];
+    const rows = needsReRead(ctx.mutation.select) && keys.length > 0
+      ? await reReadByKeys(ctx, level, keys, pk)
+      : [];
     return shape(ctx, rows, keys, needsReRead(ctx.mutation.select) ? rows.length : result.length, { inserted });
   }
 
@@ -389,7 +650,7 @@ function stripInserted(row: Record<string, unknown>): Record<string, unknown> {
 
 async function executeDelete(ctx: WriteContext, level: Level): Promise<MutationResult> {
   const filters = ctx.mutation.filters;
-  assertFilteredForWrite(level, filters, "DELETE");
+  assertFilteredForWrite(level, filters, "DELETE", ctx.allowUnfilteredViewWrites);
 
   if (!wantsRepresentation(ctx)) {
     const result = await applyFilters(level, ctx.db.deleteFrom(level.name), filters).executeTakeFirst();
@@ -397,6 +658,7 @@ async function executeDelete(ctx: WriteContext, level: Level): Promise<MutationR
   }
 
   if (wantsRepresentation(ctx) && needsReRead(ctx.mutation.select)) {
+    requirePrimaryKey(level, `Cannot return embedded representation for '${level.relation.name}' without a primary key`);
     const keys = await selectKeys(ctx, level, filters);
     if (keys.length === 0) return shape(ctx, [], undefined, 0);
     // Read the response rows before deleting them, in the same transaction.
@@ -408,7 +670,7 @@ async function executeDelete(ctx: WriteContext, level: Level): Promise<MutationR
     const pk = level.relation.primaryKey;
     let del: any = ctx.db.deleteFrom(level.name);
     del = applyFilters(level, del, filters);
-    await del.returning(pk ?? ["*"]).execute();
+    await del.returning(pk!).execute();
     const rows = readResult.map((row: any) => stripKeyColumns(row, pk));
     const keysOut = pk ? readResult.map((row: any) => remapKey(row, pk)) : undefined;
     return shape(ctx, rows, keysOut, rows.length);

@@ -28,13 +28,27 @@ create table authors (
   id serial primary key,
   name text not null
 );
+create table author_profiles (
+  id serial primary key,
+  author_id int not null unique references authors(id),
+  bio text not null
+);
 create table books (
   id serial primary key,
   author_id int not null references authors(id),
   title text not null,
   published boolean not null default false,
   meta jsonb not null default '{}'::jsonb,
-  tags text[] not null default '{}'
+  labels text[] not null default '{}'
+);
+create table tags (
+  id serial primary key,
+  name text not null
+);
+create table book_tags (
+  book_id int not null references books(id),
+  tag_id int not null references tags(id),
+  primary key (book_id, tag_id)
 );
 create table notes (
   id serial primary key,
@@ -47,10 +61,16 @@ create policy notes_owner on notes for all
   with check (owner = current_setting('request.jwt.claim.sub', true));
 
 insert into authors (name) values ('Ada'), ('Bob');
-insert into books (author_id, title, published, meta, tags) values
+insert into books (author_id, title, published, meta, labels) values
   (1, 'Alpha', true,  '{"isbn":"111"}', '{a,b}'),
   (1, 'Beta',  false, '{"isbn":"222"}', '{b}'),
   (2, 'Gamma', true,  '{"isbn":"333"}', '{c}');
+
+create view authors_view as select id, name from authors;
+create view joined_books_view as
+  select books.id, books.title, authors.name as author
+  from books join authors on authors.id = books.author_id;
+create materialized view books_materialized as select id, title from books;
 
 grant select, insert, update, delete on all tables in schema write_schema to anon, authenticated;
 grant usage, select on all sequences in schema write_schema to anon, authenticated;
@@ -99,7 +119,7 @@ suite("writes against Postgres", () => {
   test("POST returns 201 with Location and representation", async () => {
     const res = await call("/books", {
       method: "POST",
-      body: JSON.stringify({ author_id: 1, title: "New", published: true, tags: ["x"] }),
+      body: JSON.stringify({ author_id: 1, title: "New", published: true, labels: ["x"] }),
       headers: { prefer: "return=representation" },
     });
     expect(res.status).toBe(201);
@@ -200,6 +220,109 @@ suite("writes against Postgres", () => {
     const body = (await res.json()) as any[];
     expect(body[0].name).toBe("Emb");
     expect(body[0].books).toEqual([]);
+  });
+
+  test("views support reads and auto-updatable writes", async () => {
+    const read = await call("/authors_view?select=id,name&name=eq.Ada");
+    expect(read.status).toBe(200);
+    expect(await read.json()).toEqual([{ id: 1, name: "Ada" }]);
+
+    const create = await call("/authors_view", {
+      method: "POST",
+      body: JSON.stringify({ name: "View Insert" }),
+      headers: { prefer: "return=representation" },
+    });
+    expect(create.status).toBe(201);
+    const createdRows = (await create.json()) as any[];
+    expect(createdRows[0].name).toBe("View Insert");
+
+    const headersOnly = await call("/authors_view", {
+      method: "POST",
+      body: JSON.stringify({ name: "Headers Only" }),
+      headers: { prefer: "return=headers-only" },
+    });
+    expect(headersOnly.status).toBe(201);
+    expect(headersOnly.headers.get("location")).toBeNull();
+  });
+
+  test("non-updatable views and materialized views reject writes with 405", async () => {
+    const joinWrite = await call("/joined_books_view", {
+      method: "POST",
+      body: JSON.stringify({ title: "Cannot insert" }),
+    });
+    expect(joinWrite.status).toBe(405);
+    expect(joinWrite.headers.get("allow")).toBe("GET, HEAD");
+
+    const matviewWrite = await call("/books_materialized", {
+      method: "POST",
+      body: JSON.stringify({ title: "Cannot insert" }),
+    });
+    expect(matviewWrite.status).toBe(405);
+  });
+
+  test("PK-less views return a clear error for embedded write representations", async () => {
+    const res = await call("/authors_view?select=*,books(title)", {
+      method: "POST",
+      body: JSON.stringify({ name: "No PK Embed" }),
+      headers: { prefer: "return=representation" },
+    });
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as any).message).toMatch(/without a primary key/);
+  });
+
+  test("nested POST inserts a parent and to-many children atomically", async () => {
+    const before = Number((await client.query("select count(*)::int as n from write_schema.authors")).rows[0].n);
+    const res = await call("/authors?select=id,name,books(title)", {
+      method: "POST",
+      body: JSON.stringify({ name: "Nested", books: [{ title: "Nested A" }, { title: "Nested B" }] }),
+      headers: { prefer: "return=representation" },
+    });
+    expect(res.status).toBe(201);
+    const [author] = (await res.json()) as any[];
+    expect(author.name).toBe("Nested");
+    expect(author.books.map((book: any) => book.title).sort()).toEqual(["Nested A", "Nested B"]);
+    expect(Number((await client.query("select count(*)::int as n from write_schema.authors")).rows[0].n)).toBe(before + 1);
+
+    const failed = await call("/authors", {
+      method: "POST",
+      body: JSON.stringify({ name: "Must Roll Back", books: [{ published: true }] }),
+    });
+    expect(failed.status).toBe(400);
+    expect(Number((await client.query("select count(*)::int as n from write_schema.authors")).rows[0].n)).toBe(before + 1);
+  });
+
+  test("nested POST inserts a to-one relation before the parent", async () => {
+    const res = await call("/books?select=title,author:authors(name)", {
+      method: "POST",
+      body: JSON.stringify({ title: "Nested to-one", authors: { name: "Nested Author" } }),
+      headers: { prefer: "return=representation" },
+    });
+    expect(res.status).toBe(201);
+    expect(await res.json()).toEqual([{ title: "Nested to-one", author: { name: "Nested Author" } }]);
+  });
+
+  test("nested POST inserts a reverse one-to-one child after the parent", async () => {
+    const res = await call("/authors?select=name,author_profiles(bio)", {
+      method: "POST",
+      body: JSON.stringify({ name: "Profile Parent", author_profiles: { bio: "Nested bio" } }),
+      headers: { prefer: "return=representation" },
+    });
+    expect(res.status).toBe(201);
+    expect(await res.json()).toEqual([{ name: "Profile Parent", author_profiles: { bio: "Nested bio" } }]);
+
+    const spread = await call("/authors?select=name,...author_profiles(bio)&name=eq.Profile%20Parent");
+    expect(spread.status).toBe(200);
+    expect(await spread.json()).toEqual([{ name: "Profile Parent", bio: "Nested bio" }]);
+  });
+
+  test("nested POST creates many-to-many junction rows", async () => {
+    const res = await call("/books?select=title,tags(name)", {
+      method: "POST",
+      body: JSON.stringify({ author_id: 1, title: "Nested tags", tags: [{ name: "nested-tag" }] }),
+      headers: { prefer: "return=representation" },
+    });
+    expect(res.status).toBe(201);
+    expect(await res.json()).toEqual([{ title: "Nested tags", tags: [{ name: "nested-tag" }] }]);
   });
 
   test("unknown columns are dropped, strict handling throws", async () => {

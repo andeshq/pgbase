@@ -34,8 +34,8 @@ create table items (
   name text not null,
   secret text not null default 'x'
 );
--- A view with an INSTEAD OF trigger, to prove the unfiltered guard exempts views.
-create view items_readonly as select id, name from items;
+-- Auto-updatable view with no visible rows, for view-write policy tests.
+create view items_readonly as select id, name from items where id < 0;
 grant select on items_readonly to anon, authenticated;
 
 insert into items (name) values ('a'), ('b'), ('c');
@@ -139,15 +139,13 @@ suite("hardening: tier 1 + 2", () => {
     expect(del.status).toBe(400);
   });
 
-  test("views are exempt from the unfiltered-write guard", async () => {
-    // The guard should not fire for a view; the failure (if any) is a DB error,
-    // not the client-side PGRST100 guard error.
-    const del = await call("/items_readonly", { method: "DELETE" });
-    expect(del.status).not.toBe(400);
-    if (del.status < 400 && del.headers.get("content-type")?.includes("json")) {
-      const body = (await del.json()) as any;
-      expect(body?.code).not.toBe("PGRST100");
-    }
+  test("unfiltered view writes require an explicit opt-in", async () => {
+    const guarded = await call("/items_readonly", { method: "DELETE" });
+    expect(guarded.status).toBe(400);
+
+    const enabled = createPgbase({ ...base, allowUnfilteredViewWrites: true } as any);
+    const allowed = await call("/items_readonly", { method: "DELETE" }, enabled);
+    expect(allowed.status).toBe(204);
   });
 
   // -- Tier 2: body size limit -----------------------------------------------

@@ -104,6 +104,17 @@ export class PgbaseError extends Error {
     });
   }
 
+  static relationNotWritable(relation: string, method: string) {
+    return new PgbaseError(
+      "PGRST405",
+      `Cannot ${method} relation '${relation}' because it is not writable`,
+      405,
+      null,
+      null,
+      { Allow: "GET, HEAD" },
+    );
+  }
+
   static relationshipEmpty(message = "Cannot embed a relationship: no rows to relate to") {
     return new PgbaseError("PGRST124", message, 400);
   }
@@ -249,6 +260,15 @@ export function fromPostgresError(
   // 401, so an authenticated caller denied on a write gets 403 rather than 401.
   if (sqlState === "42501") {
     return new PgbaseError(sqlState, message, authenticated ? 403 : 401, details, hint);
+  }
+
+  // Only normalize the known non-updatable-view errors. SQLSTATE 55000 is
+  // broader and must not be mapped wholesale to a client error.
+  if (
+    sqlState === "55000" &&
+    /views that do not select from a single table or view are not automatically updatable|cannot change materialized view/i.test(message)
+  ) {
+    return new PgbaseError("PGRST405", message, 405, details, hint, { Allow: "GET, HEAD" });
   }
 
   return new PgbaseError(sqlState, message, statusForPgCode(sqlState), details, hint);

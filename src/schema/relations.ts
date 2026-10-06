@@ -17,6 +17,13 @@ function describeHints(fks: PgbaseForeignKey[]): string[] {
   return fks.map((fk) => `${fk.fromTable}.${fk.fromColumns.join("_")}`);
 }
 
+function isUniqueKey(relation: PgbaseRelation, columns: string[]): boolean {
+  const keys = [...(relation.primaryKey ? [relation.primaryKey] : []), ...relation.uniques];
+  return keys.some(
+    (key) => key.length === columns.length && columns.every((column) => key.includes(column)),
+  );
+}
+
 /**
  * Resolve how two relations are related, for embedding. Handles to-one,
  * to-many and many-to-many (via a junction table), disambiguated by `hint`.
@@ -37,17 +44,21 @@ export function resolveRelationship(
     const matchedOut = outgoing.filter(matchesHint);
     const matchedIn = incoming.filter(matchesHint);
     const all = [
-      ...matchedOut.map((fk) => ({ fk, direction: "one" as const })),
-      ...matchedIn.map((fk) => ({ fk, direction: "many" as const })),
+      ...matchedOut.map((fk) => ({ fk, direction: "outgoing" as const })),
+      ...matchedIn.map((fk) => ({ fk, direction: "incoming" as const })),
     ];
     if (all.length === 0) throw PgbaseError.relationshipNotFound(parent.name, related.name);
     if (all.length > 1) {
       throw PgbaseError.ambiguousEmbedding(parent.name, related.name, describeHints([...outgoing, ...incoming]));
     }
     const chosen = all[0]!;
-    return chosen.direction === "one"
+    return chosen.direction === "outgoing"
       ? { kind: "one", parentColumns: chosen.fk.fromColumns, relatedColumns: chosen.fk.toColumns }
-      : { kind: "many", parentColumns: chosen.fk.toColumns, relatedColumns: chosen.fk.fromColumns };
+      : {
+          kind: isUniqueKey(related, chosen.fk.fromColumns) ? "one" : "many",
+          parentColumns: chosen.fk.toColumns,
+          relatedColumns: chosen.fk.fromColumns,
+        };
   }
 
   if (outgoing.length > 0 && incoming.length > 0) {
@@ -65,7 +76,11 @@ export function resolveRelationship(
   }
   if (incoming.length === 1) {
     const fk = incoming[0]!;
-    return { kind: "many", parentColumns: fk.toColumns, relatedColumns: fk.fromColumns };
+    return {
+      kind: isUniqueKey(related, fk.fromColumns) ? "one" : "many",
+      parentColumns: fk.toColumns,
+      relatedColumns: fk.fromColumns,
+    };
   }
 
   // Many-to-many via a junction table with FKs to both sides.

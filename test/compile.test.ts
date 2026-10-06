@@ -61,7 +61,14 @@ const schema: PgbaseSchema = {
 
 function ctxFor(url: string): ExecContext {
   const request = parseRequest(new Request(url), "public", new URL(url).pathname.slice(1));
-  return { db, schema, request, maxRows: Infinity, maxBodyBytes: Infinity };
+  return {
+    db,
+    schema,
+    request,
+    maxRows: Infinity,
+    maxBodyBytes: Infinity,
+    allowUnfilteredViewWrites: false,
+  };
 }
 
 describe("SQL compilation", () => {
@@ -84,6 +91,22 @@ describe("SQL compilation", () => {
     ).compile();
     expect(compiled.sql).toContain("to_json");
     expect(compiled.sql).toContain('"authors"."id" = "books"."author_id"');
+  });
+
+  test("to-one spread projects child columns into the parent row", () => {
+    const compiled = buildReadQuery(
+      ctxFor("http://localhost/books?select=title,...author:authors(name)"),
+    ).compile();
+    expect(compiled.sql).toContain('(select "authors"."name" as "name"');
+    expect(compiled.sql).toContain('as "name"');
+    expect(compiled.sql.includes("json_build_object")).toBe(false);
+  });
+
+  test("spread rejects to-many relationships and duplicate output names", () => {
+    expect(() => buildReadQuery(ctxFor("http://localhost/authors?select=...books(title)")))
+      .toThrow(/Spread embedding is only supported for to-one/);
+    expect(() => buildReadQuery(ctxFor("http://localhost/books?select=id,...authors(id)")))
+      .toThrow(/conflicts with another selected column/);
   });
 
   test("to-many embed uses jsonArrayFrom", () => {

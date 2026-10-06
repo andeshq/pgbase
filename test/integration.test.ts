@@ -45,6 +45,15 @@ create table book_tags (
   tag_id int not null references tags(id),
   primary key (book_id, tag_id)
 );
+create view books_view as select id, author_id, title from books;
+create view books_chain_view as select id, author_id, title from books_view;
+create view books_with_authors as
+  select b.id, b.author_id, b.title, a.name as author_name
+  from books b join authors a on a.id = b.author_id;
+create view books_union_view as
+  select id, author_id, title from books where id < 0
+  union all
+  select id, author_id, title from books where id >= 0;
 create table secrets (
   id serial primary key,
   owner text not null,
@@ -139,6 +148,43 @@ suite("integration against Postgres", () => {
     const res = await call("/books?select=title,author:authors(name)&id=eq.1");
     const body = (await res.json()) as any[];
     expect(body).toEqual([{ title: "Alpha", author: { name: "Ada" } }]);
+  });
+
+  test("to-one spread flattens embedded columns", async () => {
+    const res = await call("/books?select=title,...author:authors(name)&id=eq.1");
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual([{ title: "Alpha", name: "Ada" }]);
+
+    const limited = await call("/books?select=title,...author:authors(name)&id=eq.1&author.limit=0");
+    expect(await limited.json()).toEqual([{ title: "Alpha", name: null }]);
+  });
+
+  test("simple views, view chains, and join views infer visible FK relationships", async () => {
+    const simple = await call("/books_view?select=title,authors(name)&id=eq.1");
+    expect(simple.status).toBe(200);
+    expect(await simple.json()).toEqual([{ title: "Alpha", authors: { name: "Ada" } }]);
+
+    const chain = await call("/books_chain_view?select=title,authors(name)&id=eq.1");
+    expect(chain.status).toBe(200);
+    expect(await chain.json()).toEqual([{ title: "Alpha", authors: { name: "Ada" } }]);
+
+    const joined = await call("/books_with_authors?select=title,authors(name)&id=eq.1");
+    expect(joined.status).toBe(200);
+    expect(await joined.json()).toEqual([{ title: "Alpha", authors: { name: "Ada" } }]);
+  });
+
+  test("UNION views do not receive inferred relationships", async () => {
+    const res = await call("/books_union_view?select=title,authors(name)&id=eq.1");
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as any).code).toBe("PGRST200");
+  });
+
+  test("spread rejects to-many and colliding output columns", async () => {
+    const toMany = await call("/authors?select=...books(title)");
+    expect(toMany.status).toBe(400);
+
+    const collision = await call("/books?select=title,...authors(title)");
+    expect(collision.status).toBe(400);
   });
 
   test("many-to-many embedding", async () => {

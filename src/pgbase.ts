@@ -28,6 +28,7 @@ interface Runtime {
   defaultLimit: number | undefined;
   basePath: string;
   maxBodyBytes: number;
+  allowUnfilteredViewWrites: boolean;
   settings: Record<string, string | number>;
   verbosity: "verbose" | "minimal";
 }
@@ -87,6 +88,7 @@ async function withSession<T>(
     bodyText,
     maxRows: runtime.maxRows,
     maxBodyBytes: runtime.maxBodyBytes,
+    allowUnfilteredViewWrites: runtime.allowUnfilteredViewWrites,
     defaultLimit: runtime.defaultLimit,
   });
 }
@@ -161,6 +163,7 @@ export function createPgbase<DB = unknown>(config: PgbaseConfig<DB>): Pgbase<DB>
     defaultLimit: config.defaultLimit,
     basePath: normalizeBasePath(config.basePath),
     maxBodyBytes: config.maxBodyBytes ?? 1024 * 1024,
+    allowUnfilteredViewWrites: config.allowUnfilteredViewWrites ?? false,
     settings: config.settings ?? {},
     verbosity: config.errorVerbosity ?? "verbose",
   };

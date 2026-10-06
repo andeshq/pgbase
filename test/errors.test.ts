@@ -58,6 +58,14 @@ describe("error mapping", () => {
     expect(fromPostgresError({ code: "42P01", message: "missing" }, "verbose", false).status).toBe(404);
   });
 
+  test("known non-updatable-view errors map to 405 without remapping all 55000s", () => {
+    const viewError = fromPostgresError(
+      { code: "55000", message: "Views that do not select from a single table or view are not automatically updatable" },
+    );
+    expect(viewError.status).toBe(405);
+    expect(fromPostgresError({ code: "55000", message: "other prerequisite state" }).status).toBe(500);
+  });
+
   test("unknown errors still map to 500", () => {
     expect(fromPostgresError({ message: "boom" }, "verbose", false).status).toBe(500);
   });

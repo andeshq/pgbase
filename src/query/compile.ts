@@ -15,6 +15,7 @@ export interface ExecContext {
   bodyText?: string;
   maxRows: number;
   maxBodyBytes: number;
+  allowUnfilteredViewWrites: boolean;
   defaultLimit?: number;
 }
 
@@ -98,7 +99,21 @@ export function buildSelectionList(ctx: ExecContext, level: QueryLevel, nodes: S
 function buildSelection(ctx: ExecContext, level: QueryLevel, nodes: SelectNode[]): any[] {
   const expanded: SelectNode[] =
     nodes.length > 0 ? nodes : [{ kind: "column", column: "*", star: true }];
+  const explicitNames = new Set<string>();
+  for (const node of expanded) {
+    if (node.kind === "column") {
+      if (node.star) {
+        for (const column of level.relation.columns) explicitNames.add(column.name);
+      } else {
+        explicitNames.add(columnOutputName(node));
+      }
+    } else if (!node.spread) {
+      explicitNames.add(node.alias ?? node.relation);
+    }
+  }
+
   const out: any[] = [];
+  const spreadNames = new Set<string>();
   for (const node of expanded) {
     if (node.kind === "column") {
       if (node.star) {
@@ -109,11 +124,58 @@ function buildSelection(ctx: ExecContext, level: QueryLevel, nodes: SelectNode[]
         const alias = node.alias ?? (node.jsonPath?.length ? node.jsonPath.at(-1)! : node.column);
         out.push(renderColumn(level, node.column, node.jsonPath, node.cast).as(alias));
       }
+    } else if (node.spread) {
+      const spread = buildSpread(ctx, level, node);
+      for (const { name, expression } of spread) {
+        if (explicitNames.has(name) || spreadNames.has(name)) {
+          throw PgbaseError.parse(`Spread column '${name}' conflicts with another selected column`);
+        }
+        spreadNames.add(name);
+        out.push(expression);
+      }
     } else {
       out.push(buildEmbed(ctx, level, node));
     }
   }
   return out;
+}
+
+function columnOutputName(node: Extract<SelectNode, { kind: "column" }>): string {
+  return node.alias ?? (node.jsonPath?.length ? node.jsonPath.at(-1)! : node.column);
+}
+
+/** Expand a to-one embed into scalar correlated subqueries in the parent row. */
+function buildSpread(ctx: ExecContext, level: QueryLevel, node: SelectEmbed): Array<{ name: string; expression: any }> {
+  const { sub, childLevel, params, relationship } = makeEmbedBase(ctx, level, node);
+  if (relationship.kind !== "one") {
+    throw PgbaseError.parse("Spread embedding is only supported for to-one relationships");
+  }
+
+  const columns: SelectNode[] = node.children.length > 0
+    ? node.children.flatMap((child) => {
+        if (child.kind === "embed") {
+          throw PgbaseError.parse("Nested embeds inside a spread are not supported");
+        }
+        if (!child.star) return [child];
+        return childLevel.relation.columns.map((column) => ({
+          kind: "column" as const,
+          column: column.name,
+        }));
+      })
+    : childLevel.relation.columns.map((column) => ({
+        kind: "column" as const,
+        column: column.name,
+      }));
+
+  const filtered = applyLevelConditions(sub, ctx, childLevel, [], params.filters);
+  return columns.map((column) => {
+    const name = columnOutputName(column as Extract<SelectNode, { kind: "column" }>);
+    let scalar = filtered.select(buildSelection(ctx, childLevel, [column]));
+    for (const term of params.order) scalar = scalar.orderBy(renderOrder(term, childLevel));
+    if (params.offset !== undefined) scalar = scalar.offset(params.offset);
+    scalar = scalar.limit(params.limit === 0 ? 0 : 1);
+    return { name, expression: sql`(${scalar})`.as(name) };
+  });
 }
 
 function buildEmbed(ctx: ExecContext, level: QueryLevel, node: SelectEmbed): any {

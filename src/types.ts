@@ -42,6 +42,10 @@ export interface PgbaseRelation {
   name: string;
   schema: string;
   kind: "table" | "view" | "materialized_view" | "partitioned_table" | "foreign_table";
+  /** View write capabilities as reported by PostgreSQL; undefined for tables. */
+  insertable?: boolean;
+  updatable?: boolean;
+  deletable?: boolean;
   columns: PgbaseColumn[];
   columnMap: Map<string, PgbaseColumn>;
   primaryKey: string[] | null;
@@ -146,6 +150,8 @@ export interface PgbaseConfig<DB = unknown> {
    * Restrict which tables/views are reachable. Omit to expose everything.
    */
   exposed?: PgbaseExposed | false;
+  /** Permit unfiltered PATCH/DELETE on updatable views. Defaults to false. */
+  allowUnfilteredViewWrites?: boolean;
   /**
    * Role used when `getSession` returns `null`. Mirrors PostgREST's
    * `db-anon-role`.

@@ -281,8 +281,8 @@ app.on(["GET", "POST"], "/api/auth/*", (c) => auth.handler(c.req.raw)); // auth
 app.all("/rest/*", (c) => pgbase.handler(c.req.raw));               // pgbase
 ```
 
-A runnable version — with the Better Auth admin plugin, a fixed role mapping, a
-least-privilege runtime DB account, RLS policies, and a demo UI — lives in
+A runnable API example — with the Better Auth admin plugin, a fixed role mapping,
+a least-privilege runtime DB account, and RLS policies — lives in
 [`example/better-auth-hono.ts`](./example/better-auth-hono.ts):
 
 ```sh
@@ -294,6 +294,20 @@ bun run example/better-auth-hono.ts migrate
 # 3. run the API as the restricted authenticator role
 export DATABASE_URL='postgres://authenticator:pgbase_dev_only@localhost:55432/pgb'
 bun run example/better-auth-hono.ts
+```
+
+Exercise the auth and data routes with curl (Better Auth checks the `Origin`):
+
+```sh
+curl -i http://localhost:3000/api/auth/sign-up/email \
+  -H 'Origin: http://localhost:3000' -H 'Content-Type: application/json' \
+  -d '{"name":"Demo","email":"demo@example.com","password":"password123"}'
+
+curl -i -c cookies.txt http://localhost:3000/api/auth/sign-in/email \
+  -H 'Origin: http://localhost:3000' -H 'Content-Type: application/json' \
+  -d '{"email":"demo@example.com","password":"password123"}'
+
+curl -b cookies.txt 'http://localhost:3000/rest/todos?select=*'
 ```
 
 The example exposes only the `app` schema through pgbase; Better Auth tables

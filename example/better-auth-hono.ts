@@ -1,10 +1,9 @@
 /**
  * Better Auth + Hono + pgbase.
  *
- * One Hono app serves three things:
+ * One Hono app serves two things:
  *   1. Better Auth's own endpoints   (/api/auth/*)
  *   2. pgbase's PostgREST API        (/rest/*)
- *   3. A tiny demo UI                (/)
  *
  * Better Auth owns authentication (sign-up/sign-in, sessions, cookies). pgbase
  * never verifies tokens itself — it asks Better Auth for the session and turns
@@ -115,47 +114,6 @@ app.on(["GET", "POST"], "/api/auth/*", (c) => auth.handler(c.req.raw));
 
 // 2. pgbase's PostgREST API.
 app.all("/rest/*", (c) => pgbase.handler(c.req.raw));
-
-// 3. A tiny demo UI so you can drive it from the browser.
-app.get("/", (c) =>
-  c.html(`<!doctype html>
-<html>
-  <head><meta charset="utf-8"><title>pgbase + Better Auth</title></head>
-  <body style="font-family: system-ui; max-width: 40rem; margin: 3rem auto">
-    <h1>pgbase + Better Auth</h1>
-    <p>Cookie-based session, resolved server-side for pgbase.</p>
-    <button onclick="signIn()">Sign in (demo user)</button>
-    <button onclick="load()">GET /rest/todos</button>
-    <pre id="out"></pre>
-    <script>
-      const out = (x) => document.getElementById("out").textContent =
-        typeof x === "string" ? x : JSON.stringify(x, null, 2);
-
-      async function signIn() {
-        const email = "demo@example.com";
-        const password = "password123";
-        // Sign up (ignore "already exists"), then sign in.
-        await fetch("/api/auth/sign-up/email", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ email, password, name: "Demo" }),
-        });
-        const res = await fetch("/api/auth/sign-in/email", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ email, password }),
-        });
-        out(await res.json());
-      }
-
-      async function load() {
-        const res = await fetch("/rest/todos?select=*");
-        out({ status: res.status, body: await res.json() });
-      }
-    </script>
-  </body>
-</html>`),
-);
 
 /** Migrations run with the separate administrative connection. */
 if (isMigration) {

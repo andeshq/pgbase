@@ -11,8 +11,8 @@ export interface ExecContext {
   schema: PgbaseSchema;
   /** The parsed request AST. Writes and RPCs narrow this to their own shape. */
   request: ParsedRequest;
-  /** The original web request, used by writes to read the body. */
-  raw?: Request;
+  /** Request body decoded before the transaction, used by writes. */
+  bodyText?: string;
   maxRows: number;
   maxBodyBytes: number;
   defaultLimit?: number;

@@ -10,8 +10,18 @@ const suite = DATABASE_URL ? describe : describe.skip;
 const SETUP_SQL = `
 do $$
 begin
-  if not exists (select from pg_roles where rolname = 'anon') then create role anon nologin; end if;
-  if not exists (select from pg_roles where rolname = 'authenticated') then create role authenticated nologin; end if;
+  create role anon nologin;
+exception when duplicate_object then null;
+end $$;
+do $$
+begin
+  create role authenticated nologin;
+exception when duplicate_object then null;
+end $$;
+do $$
+begin
+  create role write_only nologin;
+exception when duplicate_object then null;
 end $$;
 
 drop schema if exists hard cascade;
@@ -36,6 +46,15 @@ grant usage, select on all sequences in schema hard to anon, authenticated;
 -- insufficient_privilege (42501) mapping. Created after the blanket grant.
 create table locked (id serial primary key, name text not null);
 grant select on locked to anon;
+
+-- Write-only endpoint role: it can insert/update/delete but cannot select the
+-- value column. Minimal writes must not add hidden RETURNING requirements.
+create table write_only_items (id serial primary key, name text not null);
+grant usage on schema hard to write_only;
+grant insert, delete on write_only_items to write_only;
+grant update (name) on write_only_items to write_only;
+grant select (id) on write_only_items to write_only;
+grant usage, select on sequence write_only_items_id_seq to write_only;
 
 create function many_rows(n int) returns setof items language sql stable as $$
   select i.* from items i, generate_series(1, n)
@@ -89,6 +108,16 @@ suite("hardening: tier 1 + 2", () => {
     expect(((await res.json()) as any[]).length).toBe(2);
   });
 
+  test("the default maxRows cap is 1000", async () => {
+    const itemCount = Number((await client.query("select count(*)::int as n from hard.items")).rows[0].n);
+    const n = Math.ceil(1001 / itemCount);
+    const res = await call("/rpc/many_rows?select=id", {
+      method: "POST",
+      body: JSON.stringify({ n }),
+    });
+    expect(((await res.json()) as any[]).length).toBe(1000);
+  });
+
   test("RPC count is a real count, not the row count", async () => {
     const capped = createPgbase({ ...base, maxRows: 2 } as any);
     // `items` may have grown from earlier tests, so compute the expected total.
@@ -136,6 +165,15 @@ suite("hardening: tier 1 + 2", () => {
     expect(res.status).toBe(204);
   });
 
+  test("body limit counts UTF-8 bytes, not JavaScript characters", async () => {
+    const body = JSON.stringify({ name: "💥" });
+    const limit = body.length + 1;
+    expect(new TextEncoder().encode(body).byteLength > limit).toBe(true);
+    const small = createPgbase({ ...base, maxBodyBytes: limit } as any);
+    const res = await call("/items", { method: "POST", body }, small);
+    expect(res.status).toBe(413);
+  });
+
   // -- Tier 2: error verbosity ------------------------------------------------
   test("errorVerbosity minimal drops details/hint", async () => {
     const minimal = createPgbase({ ...base, errorVerbosity: "minimal" } as any);
@@ -178,6 +216,64 @@ suite("hardening: tier 1 + 2", () => {
     const anonRes = await call("/locked", { method: "POST", body: JSON.stringify({ name: "x" }) }, anon);
     expect(anonRes.status).toBe(401);
     expect(((await anonRes.json()) as any).code).toBe("42501");
+  });
+
+  test("malformed getSession results are rejected instead of using the connection role", async () => {
+    const malformed = createPgbase({ ...base, getSession: () => ({ role: "" }) } as any);
+    const res = await call("/items?select=id", {}, malformed);
+    expect(res.status).toBe(500);
+    expect(((await res.json()) as any).code).toBe("PGRST500");
+  });
+
+  test("an onError hook failure does not reject the handler", async () => {
+    const guarded = createPgbase({ ...base, onError: () => { throw new Error("logging failed"); } } as any);
+    const res = await call("/items?select=id", { headers: { cookie: "broken=%" } }, guarded);
+    expect(res.status).toBe(500);
+    expect(((await res.json()) as any).code).toBe("PGRST500");
+  });
+
+  test("a failed schema introspection is not cached forever", async () => {
+    let failOnce = true;
+    const flakyDb = db.withPlugin({
+      transformQuery(args) {
+        if (failOnce) {
+          failOnce = false;
+          throw new Error("temporary catalog connection failure");
+        }
+        return args.node;
+      },
+      async transformResult(args) {
+        return args.result;
+      },
+    });
+    const retryable = createPgbase({ ...base, database: flakyDb } as any);
+    let failed = false;
+    try {
+      await retryable.schema();
+    } catch {
+      failed = true;
+    }
+    expect(failed).toBe(true);
+    expect((await retryable.schema()).tables.has("items")).toBe(true);
+  });
+
+  test("minimal writes do not require SELECT privileges on returned columns", async () => {
+    const writeOnly = createPgbase({ ...base, getSession: () => ({ role: "write_only" }) } as any);
+    const inserted = await call("/write_only_items", {
+      method: "POST",
+      body: JSON.stringify({ name: "before" }),
+    }, writeOnly);
+    expect(inserted.status).toBe(204);
+
+    const updated = await call("/write_only_items?id=eq.1", {
+      method: "PATCH",
+      body: JSON.stringify({ name: "after" }),
+    }, writeOnly);
+    expect(updated.status).toBe(204);
+
+    const deleted = await call("/write_only_items?id=eq.1", { method: "DELETE" }, writeOnly);
+    expect(deleted.status).toBe(204);
+    expect((await client.query("select count(*)::int as n from hard.write_only_items")).rows[0].n).toBe(0);
   });
 
   // -- Tier 1.4: identifier injection ----------------------------------------

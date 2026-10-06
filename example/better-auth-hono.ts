@@ -20,7 +20,8 @@
  *   3. Start the server:              bun run example/better-auth-hono.ts
  *
  * Env:
- *   DATABASE_URL        postgres://postgres:postgres@localhost:55432/pgb
+ *   DATABASE_URL        postgres://authenticator:pgbase_dev_only@localhost:55432/pgb
+ *   ADMIN_DATABASE_URL  postgres://postgres:postgres@localhost:55432/pgb (migrations only)
  *   PORT                3000
  *   BETTER_AUTH_SECRET  32+ char secret (generate with `openssl rand -base64 32`)
  */
@@ -30,10 +31,13 @@ import { Hono } from "hono";
 import { Kysely, PostgresDialect } from "kysely";
 import { Pool } from "pg";
 import { betterAuth } from "better-auth";
+import { admin } from "better-auth/plugins";
 import { createPgbase, PgbaseError } from "../src/index.ts";
 
-const connectionString =
-  process.env.DATABASE_URL ?? "postgres://postgres:postgres@localhost:55432/pgb";
+const isMigration = process.argv[2] === "migrate";
+const connectionString = isMigration
+  ? (process.env.ADMIN_DATABASE_URL ?? "postgres://postgres:postgres@localhost:55432/pgb")
+  : (process.env.DATABASE_URL ?? "postgres://authenticator:pgbase_dev_only@localhost:55432/pgb");
 const port = Number(process.env.PORT ?? 3000);
 
 // One Kysely instance, shared by Better Auth and pgbase.
@@ -41,8 +45,9 @@ const pool = new Pool({ connectionString });
 const database = new Kysely({ dialect: new PostgresDialect({ pool }) });
 
 /**
- * Better Auth stores users/sessions in Postgres and manages cookies for us.
- * Swap the auth methods for whatever you use in production.
+ * Better Auth owns user roles through its admin plugin. The runtime DB account
+ * is deliberately not a superuser; `getSession` maps app roles to a tiny
+ * allowlist of Postgres roles below.
  */
 export const auth = betterAuth({
   // Better Auth wants the Kysely instance wrapped with its dialect type.
@@ -50,13 +55,21 @@ export const auth = betterAuth({
   baseURL: process.env.BETTER_AUTH_URL ?? `http://localhost:${port}`,
   secret: process.env.BETTER_AUTH_SECRET ?? "dev-secret-change-me-at-least-32-chars",
   emailAndPassword: { enabled: true },
-  user: {
-    additionalFields: {
-      // The app role the user gets. pgbase maps it 1:1 to a Postgres role.
-      role: { type: "string", required: false, defaultValue: "authenticated" },
-    },
-  },
+  plugins: [admin({ defaultRole: "user", adminRoles: ["admin"] })],
+  // The migration command intentionally starts before the auth tables exist.
+  advanced: { database: { validateSchema: !isMigration } },
 });
+
+function postgresRole(appRole: unknown): string {
+  const roles = Array.isArray(appRole)
+    ? appRole
+    : typeof appRole === "string"
+      ? appRole.split(",")
+      : [];
+  if (roles.includes("admin")) return "app_admin";
+  if (roles.includes("user")) return "authenticated";
+  throw new PgbaseError("PGRST302", "User has no supported application role", 403);
+}
 
 /**
  * pgbase is auth-agnostic: it just needs claims. We resolve them here from the
@@ -69,7 +82,7 @@ export const auth = betterAuth({
  */
 export const pgbase = createPgbase({
   database,
-  schemaName: "public",
+  schemaName: "app",
   extraSearchPath: ["public"],
   basePath: "/rest",
   maxRows: 1000,
@@ -79,7 +92,8 @@ export const pgbase = createPgbase({
     const session = await auth.api.getSession({ headers: request.headers });
     if (!session) return null;
     return {
-      role: (session.user as { role?: string }).role ?? "authenticated",
+      // Never pass a Better Auth role directly through as a Postgres role.
+      role: postgresRole((session.user as { role?: unknown }).role),
       sub: session.user.id,
       email: session.user.email,
     };
@@ -143,17 +157,20 @@ app.get("/", (c) =>
 </html>`),
 );
 
-/** Create Better Auth's tables (`bun run ... migrate`). */
-if (process.argv[2] === "migrate") {
+/** Migrations run with the separate administrative connection. */
+if (isMigration) {
   const ctx = await auth.$context;
   await ctx.runMigrations();
+  await pool.query(`
+    grant select, insert, update, delete on "user", "session", "account", "verification" to authenticator;
+    grant usage, select on all sequences in schema public to authenticator;
+  `);
   console.log("[pgbase] Better Auth schema is up to date");
   await database.destroy();
-  process.exit(0);
+} else {
+  serve({ fetch: app.fetch, port }, (info) => {
+    console.log(`http://localhost:${info.port}`);
+    console.log(`  auth    http://localhost:${info.port}/api/auth/*`);
+    console.log(`  pgbase  http://localhost:${info.port}/rest/*`);
+  });
 }
-
-serve({ fetch: app.fetch, port }, (info) => {
-  console.log(`http://localhost:${info.port}`);
-  console.log(`  auth    http://localhost:${info.port}/api/auth/*`);
-  console.log(`  pgbase  http://localhost:${info.port}/rest/*`);
-});

@@ -86,7 +86,7 @@ Run it with `bun run app.ts` (or `bunx wrangler`/`node` with a Hono adapter).
 | `schemaName` | `string \| string[]` | `"public"` | Exposed Postgres schema (the first entry is used until multi-schema lands). |
 | `extraSearchPath` | `string[]` | `["public"]` | Extra schemas on the request `search_path` so extensions resolve. Mirrors `db-extra-search-path`. |
 | `basePath` | `string` | `""` | Mount point, e.g. `/rest`. The root route lists exposed relations. |
-| `maxRows` | `number` | `Infinity` | Hard cap applied to every read. |
+| `maxRows` | `number` | `1000` | Hard cap applied to reads and set-returning RPCs. Set `Infinity` to disable. |
 | `defaultLimit` | `number` | — | Limit used when the request omits one. |
 | `exposed` | `{ tables?: string[]; views?: string[] } \| false` | all | Allow-list of reachable relations. |
 | `anonRole` | `string` | — | Role used when `getSession` returns `null`. Mirrors `db-anon-role`. |
@@ -243,17 +243,20 @@ entirely, the connection's role is kept.
 
 ### Hono + Better Auth
 
-Better Auth owns authentication; `pgbase` only consumes the session. Wire it up
-by passing the request headers to `auth.api.getSession` inside `getSession`:
+Better Auth owns authentication and role assignment; `pgbase` only consumes the
+session. Never pass an application role straight through as a Postgres role:
+map it to a fixed set of database roles.
 
 ```ts
 import { Hono } from "hono";
 import { betterAuth } from "better-auth";
+import { admin } from "better-auth/plugins";
 import { createPgbase } from "pgbase";
 
 const auth = betterAuth({
   database: { db: kysely, type: "postgres" },
   emailAndPassword: { enabled: true },
+  plugins: [admin({ defaultRole: "user", adminRoles: ["admin"] })],
 });
 
 const pgbase = createPgbase({
@@ -264,8 +267,9 @@ const pgbase = createPgbase({
   getSession: async (request) => {
     const session = await auth.api.getSession({ headers: request.headers });
     if (!session) return null;                        // -> anonRole
+    const appRoles = (session.user.role ?? "user").split(",");
     return {
-      role: session.user.role ?? "authenticated",     // required: Postgres role
+      role: appRoles.includes("admin") ? "app_admin" : "authenticated",
       sub: session.user.id,                           // -> request.jwt.claim.sub
       email: session.user.email,
     };
@@ -277,16 +281,29 @@ app.on(["GET", "POST"], "/api/auth/*", (c) => auth.handler(c.req.raw)); // auth
 app.all("/rest/*", (c) => pgbase.handler(c.req.raw));               // pgbase
 ```
 
-A runnable version — with RLS policies, sign-up/sign-in, and a demo UI — lives in
+A runnable version — with the Better Auth admin plugin, a fixed role mapping, a
+least-privilege runtime DB account, RLS policies, and a demo UI — lives in
 [`example/better-auth-hono.ts`](./example/better-auth-hono.ts):
 
 ```sh
-# 1. create the demo table + roles
-psql "$DATABASE_URL" -f example/schema.sql
-# 2. create Better Auth's tables
+# 1. create roles + app schema using an administrative connection
+export ADMIN_DATABASE_URL='postgres://postgres:postgres@localhost:55432/pgb'
+psql "$ADMIN_DATABASE_URL" -f example/schema.sql
+# 2. create Better Auth tables and grant runtime auth-table access
 bun run example/better-auth-hono.ts migrate
-# 3. serve
+# 3. run the API as the restricted authenticator role
+export DATABASE_URL='postgres://authenticator:pgbase_dev_only@localhost:55432/pgb'
 bun run example/better-auth-hono.ts
+```
+
+The example exposes only the `app` schema through pgbase; Better Auth tables
+remain in `public`. The default signup role is `user`. Promote a user to `admin`
+only through a trusted admin operation or a one-time administrative DB update—
+never from signup input. For local bootstrap after creating that user:
+
+```sh
+psql "$ADMIN_DATABASE_URL" -c \
+  "update public.\"user\" set role = 'admin' where email = 'admin@example.com'"
 ```
 
 ## Supported PostgREST syntax
@@ -426,11 +443,15 @@ npm run test:unit
 # Full suite, including integration
 PGB_TEST_DATABASE_URL='postgres://postgres:postgres@localhost:55432/pgb' npm test
 
+# Bun SQL + kysely-postgres-js driver regression (run with Bun)
+PGB_TEST_DATABASE_URL='postgres://postgres:postgres@localhost:55432/pgb' npm run test:bun-sql
+
 # Or run a single file
 PGB_TEST_DATABASE_URL='postgres://postgres:postgres@localhost:55432/pgb' \
   node --test test/rpc.test.ts
 ```
 
+`npm test` runs test files sequentially because Postgres roles are cluster-wide.
 Each integration suite (`read_schema`, `write_schema`, `api`) provisions its own
 Postgres schema, so they can run in the same process without interfering.
 

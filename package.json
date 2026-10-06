@@ -18,8 +18,9 @@
     "url": "git+https://github.com/andeshq/pgbase.git"
   },
   "scripts": {
-    "test": "node --test 'test/**/*.test.ts'",
+    "test": "node --test --test-concurrency=1 'test/**/*.test.ts'",
     "test:unit": "node --test 'test/parse.test.ts' 'test/compile.test.ts' 'test/errors.test.ts'",
+    "test:bun-sql": "bun run scripts/test-bun-sql-errors.mjs",
     "typecheck": "tsc --noEmit",
     "example": "node example/server.ts",
     "example:auth": "bun run example/better-auth-hono.ts"
@@ -31,6 +32,7 @@
     "better-auth": "^1.7.7",
     "hono": "^4.13.12",
     "kysely": "^0.29",
+    "kysely-postgres-js": "^5.0.1",
     "pg": "^8",
     "typescript": "^7"
   },

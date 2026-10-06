@@ -10,8 +10,13 @@ const suite = DATABASE_URL ? describe : describe.skip;
 const SETUP_SQL = `
 do $$
 begin
-  if not exists (select from pg_roles where rolname = 'anon') then create role anon nologin; end if;
-  if not exists (select from pg_roles where rolname = 'authenticated') then create role authenticated nologin; end if;
+  create role anon nologin;
+exception when duplicate_object then null;
+end $$;
+do $$
+begin
+  create role authenticated nologin;
+exception when duplicate_object then null;
 end $$;
 
 drop schema if exists write_schema cascade;

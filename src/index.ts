@@ -7,7 +7,6 @@ export type {
   Pgbase,
   PgbaseColumn,
   PgbaseConfig,
-  PgbaseContext,
   PgbaseExposed,
   PgbaseForeignKey,
   PgbaseFunction,

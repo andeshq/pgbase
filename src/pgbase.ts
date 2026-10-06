@@ -39,7 +39,19 @@ async function resolveSession(
   ctx: PgbaseContext,
 ): Promise<PgbaseSession | null> {
   const claims = runtime.config.getSession ? await runtime.config.getSession(request) : null;
-  ctx.role = claims?.role ?? (claims === null ? (runtime.config.anonRole ?? null) : null);
+  if (claims !== null) {
+    if (
+      typeof claims !== "object" ||
+      Array.isArray(claims) ||
+      typeof claims.role !== "string" ||
+      claims.role.trim() === ""
+    ) {
+      throw new PgbaseError("PGRST500", "getSession must return null or claims with a non-empty string role", 500);
+    }
+    ctx.role = claims.role;
+  } else {
+    ctx.role = runtime.config.anonRole ?? null;
+  }
   ctx.claims = claims;
   return claims;
 }
@@ -57,6 +69,7 @@ async function withSession<T>(
   ctx: PgbaseContext,
   path: string,
   session: PgbaseSession | null,
+  bodyText: string | undefined,
   operation: (base: BaseContext) => Promise<T>,
 ): Promise<T> {
   await applySession(
@@ -71,7 +84,7 @@ async function withSession<T>(
   return operation({
     db: trx,
     schema: ctx.schema,
-    raw: request,
+    bodyText,
     maxRows: runtime.maxRows,
     maxBodyBytes: runtime.maxBodyBytes,
     defaultLimit: runtime.defaultLimit,
@@ -87,12 +100,32 @@ function assertBodySize(request: Request, limit: number): void {
   }
 }
 
-/** Read the request body as text, enforcing the size limit on the actual bytes. */
+/** Read a request body with a hard byte limit, including chunked bodies. */
 async function readBodyText(request: Request, limit: number): Promise<string> {
   assertBodySize(request, limit);
-  const text = await request.clone().text();
-  if (text.length > limit) throw PgbaseError.bodyTooLarge(limit);
-  return text;
+  if (!request.body) return "";
+
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > limit) {
+      await reader.cancel().catch(() => undefined);
+      throw PgbaseError.bodyTooLarge(limit);
+    }
+    chunks.push(value);
+  }
+
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
 }
 
 /**
@@ -124,7 +157,7 @@ export function createPgbase<DB = unknown>(config: PgbaseConfig<DB>): Pgbase<DB>
     config: config as PgbaseConfig<any>,
     schemaName,
     searchPath: [schemaName, ...(config.extraSearchPath ?? ["public"])],
-    maxRows: config.maxRows ?? Infinity,
+    maxRows: config.maxRows ?? 1000,
     defaultLimit: config.defaultLimit,
     basePath: normalizeBasePath(config.basePath),
     maxBodyBytes: config.maxBodyBytes ?? 1024 * 1024,
@@ -135,7 +168,13 @@ export function createPgbase<DB = unknown>(config: PgbaseConfig<DB>): Pgbase<DB>
   let schemaPromise: Promise<PgbaseSchema> | null = null;
   const loadSchema = (): Promise<PgbaseSchema> => {
     if (!schemaPromise) {
-      schemaPromise = introspect(config.database, schemaName, config.exposed);
+      const pending = introspect(config.database, schemaName, config.exposed);
+      schemaPromise = pending;
+      // Do not cache a transient rejection forever. Preserve a newer promise
+      // installed by refresh()/NOTIFY if this one fails later.
+      void pending.catch(() => {
+        if (schemaPromise === pending) schemaPromise = null;
+      });
     }
     return schemaPromise;
   };
@@ -143,7 +182,7 @@ export function createPgbase<DB = unknown>(config: PgbaseConfig<DB>): Pgbase<DB>
   let listenerPromise: Promise<NotifyListener | null> | null = null;
   const listen = (): Promise<NotifyListener | null> => {
     if (listenerPromise) return listenerPromise;
-    listenerPromise = (async () => {
+    const pending = (async () => {
       if (!config.refreshOnNotify) return null;
       if (!config.createListenClient) {
         console.warn("[pgbase] `refreshOnNotify` requires `createListenClient`; listener disabled");
@@ -152,14 +191,18 @@ export function createPgbase<DB = unknown>(config: PgbaseConfig<DB>): Pgbase<DB>
       const client = await config.createListenClient();
       return startSchemaListener(client, {
         channel: config.notifyChannel,
-        onReload: () => {
+        onReload: async () => {
           schemaPromise = null;
-          void loadSchema();
+          await loadSchema();
         },
         onError: (error) => console.warn("[pgbase] schema listener error", error),
       });
     })();
-    return listenerPromise;
+    listenerPromise = pending;
+    void pending.catch(() => {
+      if (listenerPromise === pending) listenerPromise = null;
+    });
+    return pending;
   };
 
   const handler = async (request: Request): Promise<Response> => {
@@ -212,8 +255,12 @@ export function createPgbase<DB = unknown>(config: PgbaseConfig<DB>): Pgbase<DB>
     } catch (error) {
       if (config.debug) console.debug("[pgbase] error", error);
       if (config.onError) {
-        const custom = await config.onError(error);
-        if (custom) return custom;
+        try {
+          const custom = await config.onError(error);
+          if (custom) return custom;
+        } catch (hookError) {
+          if (config.debug) console.error("[pgbase] onError hook failed", hookError);
+        }
       }
       return errorResponse(error, runtime.verbosity, authenticated);
     }
@@ -254,7 +301,7 @@ async function runRead(
 
   const parsed = parseRequest(request, runtime.schemaName, table);
   const result = await runtime.config.database.transaction().execute((trx) =>
-    withSession(runtime, trx, request, ctx, path, session, (exec) =>
+    withSession(runtime, trx, request, ctx, path, session, undefined, (exec) =>
       executeRead({ ...exec, request: parsed }),
     ),
   );
@@ -270,11 +317,11 @@ async function runWrite(
   method: WriteMethod,
   session: PgbaseSession | null,
 ): Promise<{ response: Response; rows: number }> {
-  assertBodySize(request, runtime.maxBodyBytes);
+  const bodyText = await readBodyText(request, runtime.maxBodyBytes);
   const mutation = parseMutation(request, runtime.schemaName, table, method);
   const result = await runtime.config.database.transaction().execute((trx) =>
-    withSession(runtime, trx, request, ctx, path, session, (exec) =>
-      executeMutation({ ...exec, request: mutation, mutation }),
+    withSession(runtime, trx, request, ctx, path, session, bodyText, (exec) =>
+      executeMutation({ ...exec, request: mutation, mutation, bodyText }),
     ),
   );
   return {
@@ -326,22 +373,30 @@ async function handleRpc(
 
   const path = `rpc/${nameArg}`;
   const invoke = (trx: any, rpcIndex?: number) =>
-    withSession(runtime, trx, request, ctx, path, session, (exec) =>
+    withSession(runtime, trx, request, ctx, path, session, undefined, (exec) =>
       executeRpc({ ...exec, request: parsed, rpc: parsed, fn, rpcIndex }, method, body),
     );
 
   // `Prefer: params=bulk` invokes the function once per array element.
   if (parsed.params === "bulk" && Array.isArray(body)) {
     parsed.bulkArgs = body as Array<Record<string, unknown>>;
-    const collected: any[] = [];
-    for (let i = 0; i < body.length; i++) {
-      const result = await runtime.config.database.transaction().execute((trx) => invoke(trx, i));
-      collected.push(...result.rows);
-    }
+    const collected = await runtime.config.database.transaction().execute((trx) =>
+      withSession(runtime, trx, request, ctx, path, session, undefined, async (exec) => {
+        const rows: any[] = [];
+        for (let i = 0; i < body.length; i++) {
+          const result = await executeRpc(
+            { ...exec, request: parsed, rpc: parsed, fn, rpcIndex: i },
+            method,
+            body,
+          );
+          rows.push(...result.rows);
+        }
+        return rows;
+      }),
+    );
     return buildRpcResponse(parsed, { rows: collected, count: collected.length }, method);
   }
 
   const result = await runtime.config.database.transaction().execute((trx) => invoke(trx));
   return buildRpcResponse(parsed, result, method);
 }
-

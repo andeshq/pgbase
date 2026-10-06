@@ -10,14 +10,20 @@ const suite = DATABASE_URL ? describe : describe.skip;
 const SETUP_SQL = `
 do $$
 begin
-  if not exists (select from pg_roles where rolname = 'anon') then create role anon nologin; end if;
-  if not exists (select from pg_roles where rolname = 'authenticated') then create role authenticated nologin; end if;
+  create role anon nologin;
+exception when duplicate_object then null;
+end $$;
+do $$
+begin
+  create role authenticated nologin;
+exception when duplicate_object then null;
 end $$;
 
 create schema if not exists api;
 
 drop table if exists api.books cascade;
 drop table if exists api.authors cascade;
+drop table if exists api.bulk_calls cascade;
 
 create table api.authors (
   id serial primary key,
@@ -30,6 +36,7 @@ create table api.books (
   published boolean not null default false,
   views int not null default 0
 );
+create table api.bulk_calls (n int not null);
 
 -- Scalar function with a default argument.
 create or replace function api.add(a int, b int default 1) returns int
@@ -54,6 +61,16 @@ create or replace function api.book_stats()
 create or replace function api.bump_views(book_id int) returns int
   language sql volatile as $$
     update api.books set views = views + 1 where id = book_id returning views
+  $$;
+
+-- Used to verify a bulk RPC is all-or-nothing when a later element fails.
+create or replace function api.atomic_bulk(n int) returns int
+  language plpgsql volatile as $$
+  begin
+    insert into api.bulk_calls values (n);
+    if n = 2 then raise exception 'bulk failure' using errcode = 'P0001'; end if;
+    return n;
+  end
   $$;
 
 -- Procedure.
@@ -182,6 +199,17 @@ suite("RPC against Postgres", () => {
       headers: { prefer: "params=bulk" },
     });
     expect(await res.json()).toEqual([2, 3, 4]);
+  });
+
+  test("bulk RPC rolls back all elements if a later element fails", async () => {
+    const res = await call("/rpc/atomic_bulk", {
+      method: "POST",
+      body: JSON.stringify([{ n: 1 }, { n: 2 }]),
+      headers: { prefer: "params=bulk" },
+    });
+    expect(res.status).toBe(400);
+    const rows = await client.query("select count(*)::int as n from api.bulk_calls");
+    expect(rows.rows[0].n).toBe(0);
   });
 
   test("missing required argument is 404 PGRST202", async () => {

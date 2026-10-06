@@ -7,6 +7,7 @@ import { INSERTED_ALIAS, keyAlias, KEY_PREFIX, AFFECTED_ALIAS } from "./aliases.
 
 export interface WriteContext extends ExecContext {
   mutation: ParsedMutation;
+  bodyText: string;
 }
 
 export interface MutationResult {
@@ -42,9 +43,7 @@ export async function executeMutation(ctx: WriteContext): Promise<MutationResult
 // ---------------------------------------------------------------------------
 
 async function readBodyRows(ctx: WriteContext): Promise<Record<string, unknown>[]> {
-  if (!ctx.raw) throw PgbaseError.parse("Missing request body");
-  const text = await ctx.raw.clone().text();
-  if (text.length > ctx.maxBodyBytes) throw PgbaseError.bodyTooLarge(ctx.maxBodyBytes);
+  const text = ctx.bodyText;
   if (text.trim() === "") return [];
   let parsed: unknown;
   try {
@@ -189,6 +188,11 @@ function shape(  ctx: WriteContext,
   };
 }
 
+function affectedRows(result: any): number {
+  const count = result?.numInsertedOrUpdatedRows ?? result?.numUpdatedRows ?? result?.numDeletedRows;
+  return Number(count ?? 0);
+}
+
 // ---------------------------------------------------------------------------
 // POST
 // ---------------------------------------------------------------------------
@@ -204,6 +208,11 @@ async function executeInsert(ctx: WriteContext, level: Level): Promise<MutationR
 
   let qb: any = ctx.db.insertInto(level.name).values(rows);
   qb = applyConflict(ctx, qb);
+
+  if (!wantsRepresentation(ctx) && ctx.mutation.prefer.return === "minimal") {
+    const result = await qb.executeTakeFirst();
+    return shape(ctx, [], undefined, affectedRows(result));
+  }
 
   if (!wantsRepresentation(ctx)) {
     const result = await qb.returning(returnKeys).execute();
@@ -241,6 +250,12 @@ async function executeUpdate(ctx: WriteContext, level: Level): Promise<MutationR
 
   if (Object.keys(changes).length === 0) return shape(ctx, [], undefined, 0);
   assertFilteredForWrite(level, filters, "PATCH");
+
+  if (!wantsRepresentation(ctx)) {
+    const result = await applyFilters(level, ctx.db.updateTable(level.name).set(renderValues(changes)), filters)
+      .executeTakeFirst();
+    return shape(ctx, [], undefined, affectedRows(result));
+  }
 
   if (wantsRepresentation(ctx) && needsReRead(ctx.mutation.select)) {
     const keys = await selectKeys(ctx, level, filters);
@@ -328,6 +343,11 @@ async function executeUpsert(ctx: WriteContext, level: Level): Promise<MutationR
 
   const pk = level.relation.primaryKey ?? target;
 
+  if (ctx.mutation.prefer.return === "minimal") {
+    const result = await qb.executeTakeFirst();
+    return shape(ctx, [], undefined, affectedRows(result));
+  }
+
   // `xmax = 0` distinguishes a fresh insert from an updated row, and the key
   // aliases give us the primary key for `Location`; both are stripped from the
   // response body. The three cases differ only in what else is selected.
@@ -370,6 +390,11 @@ function stripInserted(row: Record<string, unknown>): Record<string, unknown> {
 async function executeDelete(ctx: WriteContext, level: Level): Promise<MutationResult> {
   const filters = ctx.mutation.filters;
   assertFilteredForWrite(level, filters, "DELETE");
+
+  if (!wantsRepresentation(ctx)) {
+    const result = await applyFilters(level, ctx.db.deleteFrom(level.name), filters).executeTakeFirst();
+    return shape(ctx, [], undefined, affectedRows(result));
+  }
 
   if (wantsRepresentation(ctx) && needsReRead(ctx.mutation.select)) {
     const keys = await selectKeys(ctx, level, filters);

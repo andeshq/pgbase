@@ -20,9 +20,9 @@ export interface ListenClient {
 /** A column as introspected from the database. */
 export interface PgbaseColumn {
   name: string;
-  /** `information_schema.columns.data_type`, e.g. `integer`, `ARRAY`, `USER-DEFINED`. */
+  /** Normalized Postgres type name, e.g. `integer`, `ARRAY`, `USER-DEFINED`. */
   type: string;
-  /** `information_schema.columns.udt_name`, e.g. `int4`, `_text`, `jsonb`. */
+  /** Postgres type name, e.g. `int4`, `_text`, `jsonb`. */
   udt: string;
   nullable: boolean;
   default: string | null;
@@ -112,7 +112,9 @@ export interface PgbaseSession {
    * existing RLS policies keep working.
    */
   [claim: string]: unknown;
-}export interface PgbaseConfig<DB = unknown> {
+}
+
+export interface PgbaseConfig<DB = unknown> {
   /** Your Kysely instance. pgb never opens its own connection. */
   database: Kysely<DB>;
   /**
@@ -131,7 +133,7 @@ export interface PgbaseSession {
    * Defaults to the root (`""`), matching PostgREST.
    */
   basePath?: string;
-  /** Hard cap applied to every read. `Infinity` (default) means no cap. */
+  /** Hard cap applied to every read. Defaults to 1000; use `Infinity` to disable. */
   maxRows?: number;
   /** Default limit when the request does not specify one. */
   defaultLimit?: number;
@@ -188,7 +190,7 @@ export interface PgbaseSession {
   notifyChannel?: string;
   /**
    * Resolve the request's database identity as a claim object. Called at most
-   * once per request, inside the request transaction.
+   * once per request, before opening the request transaction.
    *
    * - `role` is required: pgb runs `SET LOCAL ROLE <role>`. Every other key is
    *   exposed to Postgres as `request.jwt.claims` and `request.jwt.claim.<key>`.

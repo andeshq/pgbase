@@ -117,10 +117,28 @@ export async function introspect(
   `.execute(db);
 
   const columnRows = await sql<ColumnRow>`
-    select table_name, column_name, data_type, udt_name, is_nullable, column_default, ordinal_position
-    from information_schema.columns
-    where table_schema = ${schemaName}
-    order by table_name, ordinal_position
+    select c.relname as table_name,
+           a.attname as column_name,
+           case
+             when t.typcategory = 'A' then 'ARRAY'
+             when t.typtype in ('c', 'e') then 'USER-DEFINED'
+             else format_type(a.atttypid, a.atttypmod)
+           end as data_type,
+           t.typname as udt_name,
+           case when a.attnotnull or t.typnotnull then 'NO' else 'YES' end as is_nullable,
+           pg_get_expr(d.adbin, d.adrelid) as column_default,
+           a.attnum as ordinal_position
+    from pg_attribute a
+    join pg_class c on c.oid = a.attrelid
+    join pg_namespace n on n.oid = c.relnamespace
+    join pg_type t on t.oid = a.atttypid
+    left join pg_attrdef d on d.adrelid = a.attrelid and d.adnum = a.attnum
+    where n.nspname = ${schemaName}
+      and c.relkind in ('r', 'v', 'm', 'p', 'f')
+      and not c.relispartition
+      and a.attnum > 0
+      and not a.attisdropped
+    order by c.relname, a.attnum
   `.execute(db);
 
   const keyRows = await sql<KeyRow>`

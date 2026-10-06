@@ -1,8 +1,30 @@
 import { after as afterAll, before as beforeAll, describe, test } from "node:test";
+import { EventEmitter } from "node:events";
 import { expect } from "./expect.ts";
 import { Client, Pool } from "pg";
 import { Kysely, PostgresDialect } from "kysely";
 import { createPgbase } from "../src/index.ts";
+import { startSchemaListener } from "../src/schema-listener.ts";
+
+test("listener reports an asynchronous schema reload failure", async () => {
+  const client: any = new EventEmitter();
+  client.query = async () => undefined;
+  client.end = async () => undefined;
+  const failure = new Error("introspection unavailable");
+  let reported: unknown;
+  const listener = await startSchemaListener(client, {
+    onReload: async () => {
+      throw failure;
+    },
+    onError: (error) => {
+      reported = error;
+    },
+  });
+  client.emit("notification", { channel: "pgrst", payload: "reload schema" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(reported).toBe(failure);
+  await listener.stop();
+});
 
 const DATABASE_URL = process.env.PGB_TEST_DATABASE_URL;
 const suite = DATABASE_URL ? describe : describe.skip;
@@ -16,6 +38,8 @@ suite("schema NOTIFY listener", () => {
     client = new Client({ connectionString: DATABASE_URL });
     await client.connect();
     await client.query(`
+      do $$ begin create role anon nologin; exception when duplicate_object then null; end $$;
+      do $$ begin create role authenticated nologin; exception when duplicate_object then null; end $$;
       drop schema if exists note cascade;
       create schema note;
       grant usage on schema note to anon, authenticated;

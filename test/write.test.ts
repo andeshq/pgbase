@@ -116,26 +116,97 @@ suite("writes against Postgres", () => {
     await client?.end();
   });
 
-  test("POST returns 201 with Location and representation", async () => {
+  test("POST with representation returns 201 and no Location", async () => {
     const res = await call("/books", {
       method: "POST",
       body: JSON.stringify({ author_id: 1, title: "New", published: true, labels: ["x"] }),
       headers: { prefer: "return=representation" },
     });
     expect(res.status).toBe(201);
-    expect(res.headers.get("location")).toBe("/rest/books?id=eq.4");
+    // PostgREST only builds `Location` for `return=headers-only`.
+    expect(res.headers.get("location")).toBeNull();
     expect(res.headers.get("preference-applied")).toBe("return=representation");
     const body = (await res.json()) as any[];
     expect(body[0]).toMatchObject({ id: 4, title: "New", published: true });
   });
 
-  test("POST default is minimal 204", async () => {
+  test("POST default is minimal 201 with no body", async () => {
     const res = await call("/books", {
       method: "POST",
       body: JSON.stringify({ author_id: 2, title: "Silent" }),
     });
-    expect(res.status).toBe(204);
+    expect(res.status).toBe(201);
     expect(await res.text()).toBe("");
+  });
+
+  test("headers-only writes use PostgREST statuses and only POST gets Location", async () => {
+    const created = await call("/books", {
+      method: "POST",
+      body: JSON.stringify({ author_id: 1, title: "Headers" }),
+      headers: { prefer: "return=headers-only" },
+    });
+    expect(created.status).toBe(201);
+    const location = created.headers.get("location")!;
+    expect(location).not.toBeNull();
+    expect(await created.text()).toBe("");
+    const id = Number(new URL(`http://localhost${location}`).searchParams.get("id")!.replace("eq.", ""));
+
+    const patched = await call(`/books?id=eq.${id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ published: true }),
+      headers: { prefer: "return=headers-only" },
+    });
+    expect(patched.status).toBe(204);
+
+    const put = await call(`/books?id=eq.${id}`, {
+      method: "PUT",
+      body: JSON.stringify({ id, author_id: 1, title: "Headers PUT" }),
+      headers: { prefer: "return=headers-only" },
+    });
+    expect(put.status).toBe(204);
+
+    const deleted = await call(`/books?id=eq.${id}`, {
+      method: "DELETE",
+      headers: { prefer: "return=headers-only" },
+    });
+    expect(deleted.status).toBe(204);
+  });
+
+  test("write Content-Range matches PostgREST per method", async () => {
+    const post = await call("/books", {
+      method: "POST",
+      body: JSON.stringify({ author_id: 1, title: "Range" }),
+    });
+    expect(post.headers.get("content-range")).toBe("*/*");
+
+    const postCounted = await call("/books", {
+      method: "POST",
+      body: JSON.stringify({ author_id: 1, title: "Range counted" }),
+      headers: { prefer: "count=exact" },
+    });
+    expect(postCounted.headers.get("content-range")).toBe("*/1");
+
+    const created = await call("/books?select=id", {
+      method: "POST",
+      body: JSON.stringify({ author_id: 1, title: "Range patch" }),
+      headers: { prefer: "return=representation" },
+    });
+    const rangeId = ((await created.json()) as any[])[0].id;
+
+    const patch = await call(`/books?id=eq.${rangeId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ published: true }),
+    });
+    expect(patch.headers.get("content-range")).toBe("0-0/*");
+
+    const put = await call(`/books?id=eq.${rangeId}`, {
+      method: "PUT",
+      body: JSON.stringify({ id: rangeId, author_id: 1, title: "Range PUT" }),
+    });
+    expect(put.headers.get("content-range")).toBeNull();
+
+    const deleted = await call(`/books?id=eq.${rangeId}`, { method: "DELETE" });
+    expect(deleted.headers.get("content-range")).toBe("*/*");
   });
 
   test("bulk POST with representation", async () => {
@@ -158,7 +229,7 @@ suite("writes against Postgres", () => {
       headers: { prefer: "return=representation, count=exact" },
     });
     expect(res.status).toBe(200);
-    expect(res.headers.get("content-range")).toBe("*/1");
+    expect(res.headers.get("content-range")).toBe("0-0/1");
     const body = (await res.json()) as any[];
     expect(body[0].published).toBe(false);
   });

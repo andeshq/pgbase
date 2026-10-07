@@ -14,6 +14,7 @@ export function expect(actual: unknown): {
   toBeGreaterThanOrEqual(expected: number): void;
   not: {
     toBe(expected: unknown): void;
+    toBeNull(): void;
   };
   toBeUndefined(): void;
   toBeNull(): void;
@@ -43,6 +44,7 @@ export function expect(actual: unknown): {
     toBeGreaterThanOrEqual: (expected) => assert.ok((actual as number) >= expected),
     not: {
       toBe: (expected) => assert.notEqual(actual, expected),
+      toBeNull: () => assert.notEqual(actual, null),
     },
     toBeUndefined: () => assert.equal(actual, undefined),
     toBeNull: () => assert.equal(actual, null),

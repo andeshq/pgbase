@@ -373,10 +373,10 @@ PATCH  /rest/books?id=eq.1            # requires a filter
 PUT    /rest/books?id=eq.1            # upsert on the primary key or ?on_conflict=
 DELETE /rest/books?id=eq.1            # requires a filter
 
-Prefer: return=representation            # 201/200 with the affected rows
-Prefer: return=minimal                   # 204, no body (default)
-Prefer: return=headers-only              # status + headers only
-Prefer: count=exact                      # Content-Range: */N
+Prefer: return=representation            # POST 201 / PATCH|PUT|DELETE 200 with rows
+Prefer: return=minimal                   # POST 201 / PATCH|PUT|DELETE 204, no body (default)
+Prefer: return=headers-only              # same statuses, no body; only POST gets Location
+Prefer: count=exact                      # Content-Range total is the affected count
 Prefer: resolution=merge-duplicates      # POST upsert
 Prefer: resolution=ignore-duplicates     # POST skip conflicts
 Prefer: missing=default                  # omitted columns use DEFAULT, not NULL
@@ -425,8 +425,10 @@ Nested writes reject `columns`, conflict resolution, and `missing=default`, and
 `on_conflict` is only allowed for nested `PUT`. Everything runs in the request
 transaction, so a failure at any depth rolls back the whole request.
 
-- `POST` replies `201 Created` with a `Location` header pointing at the new row.
-- `PUT` replies `201` when it inserted and `200` when it updated.
+- `POST` replies `201 Created` (or `200` when `resolution=merge-duplicates` inserted nothing). `Location` is only sent with `Prefer: return=headers-only`.
+- `PUT` replies `201` when it inserted and `200` when it updated with `return=representation`; otherwise `204`.
+- `PATCH`/`DELETE` reply `200` with `return=representation`, otherwise `204`.
+- `Content-Range` follows PostgREST: `*/*` for POST/DELETE, `0-N/*` for PATCH, and none for PUT; the total is the affected count when `Prefer: count` is requested.
 - Unfiltered `PATCH`/`DELETE` are rejected by default for tables and views;
   explicitly set `allowUnfilteredViewWrites: true` only when a view is safe to sweep.
 - `Prefer: return=representation` re-reads embedded/many-to-many results, or uses a

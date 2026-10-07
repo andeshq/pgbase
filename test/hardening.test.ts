@@ -160,7 +160,7 @@ suite("hardening: tier 1 + 2", () => {
     const body = JSON.stringify({ name: "ok" });
     const exact = createPgbase({ ...base, maxBodyBytes: body.length } as any);
     const res = await call("/items", { method: "POST", body }, exact);
-    expect(res.status).toBe(204);
+    expect(res.status).toBe(201);
   });
 
   test("body limit counts UTF-8 bytes, not JavaScript characters", async () => {
@@ -261,7 +261,7 @@ suite("hardening: tier 1 + 2", () => {
       method: "POST",
       body: JSON.stringify({ name: "before" }),
     }, writeOnly);
-    expect(inserted.status).toBe(204);
+    expect(inserted.status).toBe(201);
 
     const updated = await call("/write_only_items?id=eq.1", {
       method: "PATCH",

@@ -113,10 +113,48 @@ function appliedPreferences(request: ParsedMutation): string {
   return parts.join(", ");
 }
 
-function writeStatus(request: ParsedMutation, ctx: PgbaseContext, count: number | null, inserted?: boolean): number {
-  if (ctx.role === "anon" && count === 0 && request.method !== "POST") return 401;
-  if (request.method === "PUT") return inserted === false ? 200 : 201;
-  return request.method === "POST" ? 201 : 200;
+/**
+ * PostgREST write status codes: creates are always `201` (or `200` when
+ * `merge-duplicates` inserted nothing), and updates/deletes are `200` only when
+ * a representation is requested; every other write preference is `204`.
+ */
+function writeStatus(
+  request: ParsedMutation,
+  ctx: PgbaseContext,
+  count: number | null,
+  inserted?: boolean,
+): number {
+  // An anonymous representation request that matched zero rows is surfaced as
+  // 401 rather than 200 with an empty body.
+  if (
+    ctx.role === "anon" &&
+    count === 0 &&
+    request.method !== "POST" &&
+    request.prefer.return === "representation"
+  ) {
+    return 401;
+  }
+  if (request.method === "POST") {
+    if (request.prefer.resolution === "merge-duplicates" && (count ?? 0) === 0) return 200;
+    return 201;
+  }
+  if (request.prefer.return === "representation") {
+    if (request.method === "PUT") return inserted === false ? 200 : 201;
+    return 200;
+  }
+  return 204;
+}
+
+/**
+ * `Content-Range` for writes, mirroring PostgREST: POST and DELETE report `*`,
+ * PATCH reports the affected window, and PUT reports no range at all. The total
+ * is the affected count only when `Prefer: count` was requested.
+ */
+function writeContentRange(request: ParsedMutation, count: number | null): string | null {
+  if (request.method === "PUT") return null;
+  const total = request.count ? String(count ?? 0) : "*";
+  if (request.method === "PATCH" && (count ?? 0) > 0) return `0-${count! - 1}/${total}`;
+  return `*/${total}`;
 }
 
 export function buildWriteResponse(
@@ -125,7 +163,7 @@ export function buildWriteResponse(
   ctx: PgbaseContext,
   basePath = "",
 ): Response {
-  const { rows, count, affected } = result;
+  const { rows, count } = result;
   const represent = request.prefer.return === "representation";
 
   if (request.singular && represent && rows.length !== 1) throw PgbaseError.notSingular(rows.length);
@@ -133,32 +171,29 @@ export function buildWriteResponse(
   const headers = new Headers();
   const applied = appliedPreferences(request);
   if (applied) headers.set("Preference-Applied", applied);
-  if (count !== null) headers.set("Content-Range", wantsRangeForWrite(request) ? `*/${count}` : "*/*");
+  const range = writeContentRange(request, count);
+  if (range !== null) headers.set("Content-Range", range);
   if (request.profile) headers.set("Content-Profile", request.profile);
 
-  // `Location` points at the affected row's primary key, mirroring PostgREST.
-  if (request.method === "POST" && result.keys?.length === 1) {
+  // PostgREST only builds a `Location` for POST + `return=headers-only`, and
+  // only when exactly one row was created.
+  if (request.method === "POST" && request.prefer.return === "headers-only" && result.keys?.length === 1) {
     const query = Object.entries(result.keys[0]!)
       .map(([column, value]) => `${column}=eq.${encodeURIComponent(String(value))}`)
       .join("&");
     if (query) headers.set("Location", `${basePath}/${request.table}?${query}`);
   }
 
-  if (request.prefer.return === "minimal") return new Response(null, { status: 204, headers });
-
   const status = writeStatus(request, ctx, count, result.inserted);
-  const hasBody = request.prefer.return !== "headers-only";
+  if (!represent) return new Response(null, { status, headers });
+
   return send({
     rows,
     status,
     headers,
     format: request.singular ? "singular" : request.format,
-    body: hasBody,
+    body: true,
   });
-}
-
-function wantsRangeForWrite(request: ParsedMutation): boolean {
-  return request.method !== "POST" || request.count !== null;
 }
 
 // ---------------------------------------------------------------------------

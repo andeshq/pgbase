@@ -238,9 +238,7 @@ async function executeInsert(ctx: WriteContext, level: Level): Promise<MutationR
     }),
   );
   if (hasNestedBody) {
-    if (ctx.mutation.columns || ctx.mutation.onConflict || ctx.mutation.prefer.resolution) {
-      throw PgbaseError.parse("Nested POST does not support `columns`, `on_conflict`, or conflict resolution");
-    }
+    assertNestedWriteSupported(ctx, "POST");
     const pk = requirePrimaryKey(level, "Nested POST requires a primary key on the parent relation");
     const keys: Array<Record<string, unknown>> = [];
     for (const row of bodyRows) {
@@ -322,6 +320,49 @@ function isJsonObject(value: unknown): value is Record<string, unknown> {
 
 function looksLikeNestedValue(value: unknown): boolean {
   return isJsonObject(value) || (Array.isArray(value) && value.length > 0 && value.every(isJsonObject));
+}
+
+function hasAllKeys(value: Record<string, unknown>, keys: string[]): boolean {
+  return keys.every((key) => value[key] !== undefined);
+}
+
+/**
+ * Nested writes manage their own child rows, so top-level preferences that
+ * reshape a single statement (`columns`, conflict resolution, `missing=default`)
+ * do not compose with them. `on_conflict` is only meaningful for the nested PUT
+ * parent upsert, so it is allowed there.
+ */
+function assertNestedWriteSupported(ctx: WriteContext, method: string, allowOnConflict = false): void {
+  const unsupported = [
+    ctx.mutation.columns ? "`columns`" : null,
+    !allowOnConflict && ctx.mutation.onConflict ? "`on_conflict`" : null,
+    ctx.mutation.prefer.resolution ? "conflict resolution" : null,
+    ctx.mutation.prefer.missing === "default" ? "`missing=default`" : null,
+  ].filter((entry): entry is string => entry !== null);
+  if (unsupported.length > 0) {
+    throw PgbaseError.parse(`Nested ${method} does not support ${unsupported.join(", ")}`);
+  }
+}
+
+/** Columns actually provided by the caller, without `missing=default` expansion. */
+function reconcileProvided(
+  ctx: WriteContext,
+  level: Level,
+  row: Record<string, unknown>,
+  dropped: Set<string>,
+): Record<string, unknown> {
+  const strict = ctx.mutation.prefer.handling === "strict";
+  const out: Record<string, unknown> = {};
+  for (const key of Object.keys(row)) {
+    const column = key.trim();
+    if (!level.relation.columnMap.has(column)) {
+      if (strict) throw PgbaseError.columnNotFound(column, level.relation.name);
+      dropped.add(column);
+      continue;
+    }
+    out[column] = row[key];
+  }
+  return out;
 }
 
 function splitNestedBody(
@@ -455,7 +496,11 @@ async function insertNestedRow(
       : field.value as Array<Record<string, unknown>>;
     for (const childBody of childBodies) {
       const child = { ...childBody };
-      assignForeignKeys(child, relationship.relatedColumns, inserted, relationship.parentColumns);
+      // Many-to-many links live in the junction table, so the parent key is not
+      // a column on the related row.
+      if (relationship.kind !== "many-to-many") {
+        assignForeignKeys(child, relationship.relatedColumns, inserted, relationship.parentColumns);
+      }
       const relatedLevel = resolveLevel(ctx.schema, field.relation.name);
       const relatedRow = await insertNestedRow(
         ctx,
@@ -487,6 +532,197 @@ async function insertNestedRow(
   return inserted;
 }
 
+// ---------------------------------------------------------------------------
+// Nested updates (PATCH / PUT)
+// ---------------------------------------------------------------------------
+
+function nullsFor(columns: string[]): Record<string, unknown> {
+  return Object.fromEntries(columns.map((column) => [column, null]));
+}
+
+/**
+ * Update one related row by primary key. When `link` is given, the row must also
+ * be linked to `parent` through the relationship's foreign key, so a nested body
+ * can never update a row that belongs to another parent.
+ */
+async function updateRelatedRow(
+  ctx: WriteContext,
+  level: Level,
+  element: Record<string, unknown>,
+  link: { childColumns: string[]; parent: Record<string, unknown>; parentColumns: string[] } | null,
+): Promise<void> {
+  const pk = requirePrimaryKey(level, `Nested update requires a primary key on '${level.relation.name}'`);
+  const changes = reconcileProvided(ctx, level, element, new Set());
+  let qb: any = ctx.db.updateTable(level.name).set(renderValues(changes));
+  for (const column of pk) qb = qb.where(column, "=", element[column]);
+  if (link) {
+    link.childColumns.forEach((column, index) => {
+      const expected = link.parent[link.parentColumns[index]!];
+      const provided = element[column];
+      if (provided !== undefined && String(provided) !== String(expected)) {
+        throw PgbaseError.parse(
+          `Nested update for '${level.relation.name}' cannot move a row to a different parent`,
+        );
+      }
+      qb = qb.where(column, "=", expected);
+    });
+  }
+  const result = await qb.executeTakeFirst();
+  if (affectedRows(result) === 0) {
+    throw PgbaseError.parse(
+      `Nested ${ctx.mutation.method} could not find a related '${level.relation.name}' row for the given key`,
+    );
+  }
+}
+
+async function linkJunctionRow(
+  ctx: WriteContext,
+  relationship: Extract<Relationship, { kind: "many-to-many" }>,
+  parent: Record<string, unknown>,
+  related: Record<string, unknown>,
+): Promise<void> {
+  const junctionRow: Record<string, unknown> = {};
+  assignForeignKeys(junctionRow, relationship.junctionParentColumns, parent, relationship.parentColumns);
+  assignForeignKeys(junctionRow, relationship.junctionRelatedColumns, related, relationship.relatedColumns);
+  await ctx.db
+    .insertInto(relationship.junction)
+    .values(junctionRow)
+    .onConflict((oc: any) => oc.doNothing())
+    .executeTakeFirst();
+}
+
+/**
+ * Apply one nested relation body to a single parent row. Returns the parent FK
+ * columns to write when the parent owns the foreign key (many-to-one/one-to-one
+ * from the parent side).
+ */
+async function applyNestedToParent(
+  ctx: WriteContext,
+  parent: Record<string, unknown>,
+  field: NestedBodyField,
+  depth: number,
+): Promise<Record<string, unknown>> {
+  const relationship = field.relationship;
+  const relatedLevel = resolveLevel(ctx.schema, field.relation.name);
+  const parentChanges: Record<string, unknown> = {};
+
+  if (relationship.kind === "one" && field.parentOwnsForeignKey) {
+    if (field.value === null) {
+      assignForeignKeys(parentChanges, relationship.parentColumns, nullsFor(relationship.relatedColumns), relationship.relatedColumns);
+      return parentChanges;
+    }
+    const element = field.value as Record<string, unknown>;
+    const relatedPk = relatedLevel.relation.primaryKey;
+    if (relatedPk && hasAllKeys(element, relatedPk)) {
+      await updateRelatedRow(ctx, relatedLevel, element, null);
+      assignForeignKeys(parentChanges, relationship.parentColumns, element, relationship.relatedColumns);
+    } else {
+      const inserted = await insertNestedRow(ctx, relatedLevel, element, relationship.relatedColumns, depth + 1);
+      assignForeignKeys(parentChanges, relationship.parentColumns, inserted, relationship.relatedColumns);
+    }
+    return parentChanges;
+  }
+
+  if (relationship.kind === "one") {
+    if (field.value === null) return parentChanges;
+    const element = field.value as Record<string, unknown>;
+    const relatedPk = relatedLevel.relation.primaryKey;
+    if (relatedPk && hasAllKeys(element, relatedPk)) {
+      await updateRelatedRow(ctx, relatedLevel, element, {
+        childColumns: relationship.relatedColumns,
+        parent,
+        parentColumns: relationship.parentColumns,
+      });
+    } else {
+      const child = { ...element };
+      assignForeignKeys(child, relationship.relatedColumns, parent, relationship.parentColumns);
+      await insertNestedRow(ctx, relatedLevel, child, [], depth + 1);
+    }
+    return parentChanges;
+  }
+
+  for (const element of field.value as Array<Record<string, unknown>>) {
+    const relatedPk = relatedLevel.relation.primaryKey;
+    if (relatedPk && hasAllKeys(element, relatedPk)) {
+      if (relationship.kind === "many-to-many") {
+        await updateRelatedRow(ctx, relatedLevel, element, null);
+        await linkJunctionRow(ctx, relationship, parent, element);
+      } else {
+        await updateRelatedRow(ctx, relatedLevel, element, {
+          childColumns: relationship.relatedColumns,
+          parent,
+          parentColumns: relationship.parentColumns,
+        });
+      }
+    } else {
+      const child = { ...element };
+      if (relationship.kind !== "many-to-many") {
+        assignForeignKeys(child, relationship.relatedColumns, parent, relationship.parentColumns);
+      }
+      const relatedRow = await insertNestedRow(
+        ctx,
+        relatedLevel,
+        child,
+        relationship.kind === "many-to-many" ? relationship.relatedColumns : [],
+        depth + 1,
+      );
+      if (relationship.kind === "many-to-many") {
+        await linkJunctionRow(ctx, relationship, parent, relatedRow);
+      }
+    }
+  }
+  return parentChanges;
+}
+
+/** Apply every nested field to every matched parent row, then update parent FKs. */
+async function applyNestedWrites(
+  ctx: WriteContext,
+  level: Level,
+  parentRows: Array<Record<string, unknown>>,
+  parentKeyColumns: string[],
+  nested: NestedBodyField[],
+  scalarChanges: Record<string, unknown>,
+): Promise<void> {
+  for (const parent of parentRows) {
+    const parentChanges = { ...scalarChanges };
+    for (const field of nested) {
+      Object.assign(parentChanges, await applyNestedToParent(ctx, parent, field, 0));
+    }
+    if (Object.keys(parentChanges).length === 0) continue;
+    let update: any = ctx.db.updateTable(level.name).set(renderValues(parentChanges));
+    for (const column of parentKeyColumns) update = update.where(column, "=", parent[column]);
+    await update.executeTakeFirst();
+  }
+}
+
+async function updateNested(
+  ctx: WriteContext,
+  level: Level,
+  scalarBody: Record<string, unknown>,
+  nested: NestedBodyField[],
+  filters: FilterNode[],
+): Promise<MutationResult> {
+  assertNestedWriteSupported(ctx, ctx.mutation.method);
+  assertFilteredForWrite(level, filters, ctx.mutation.method, ctx.allowUnfilteredViewWrites);
+  const pk = requirePrimaryKey(level, `Nested ${ctx.mutation.method} requires a primary key on the parent relation`);
+
+  const parentColumns = new Set(pk);
+  for (const field of nested) field.relationship.parentColumns.forEach((column) => parentColumns.add(column));
+  const parentRows: Array<Record<string, unknown>> = await applyFilters(
+    level,
+    ctx.db.selectFrom(level.name).select([...parentColumns]),
+    filters,
+  ).execute();
+  if (parentRows.length === 0) return shape(ctx, [], undefined, 0);
+
+  const scalarChanges = reconcileProvided(ctx, level, scalarBody, new Set());
+  await applyNestedWrites(ctx, level, parentRows, pk, nested, scalarChanges);
+
+  const keys = parentRows.map((row) => pick(row, pk));
+  const rows = wantsRepresentation(ctx) ? await reReadByKeys(ctx, level, keys) : [];
+  return shape(ctx, rows, keys, parentRows.length);
+}
+
 function pick(row: Record<string, unknown>, columns: string[]): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const column of columns) out[column] = row[column];
@@ -503,8 +739,12 @@ async function executeUpdate(ctx: WriteContext, level: Level): Promise<MutationR
     throw PgbaseError.parse("PATCH requires exactly one JSON object in the body");
   }
   const dropped = new Set<string>();
-  const changes = reconcileRow(ctx, level, bodyRows[0]!, dropped);
+  const { row: body, nested } = splitNestedBody(ctx, level, bodyRows[0]!, dropped);
   const filters = ctx.mutation.filters;
+
+  if (nested.length > 0) return updateNested(ctx, level, body, nested, filters);
+
+  const changes = reconcileRow(ctx, level, body, dropped);
 
   if (Object.keys(changes).length === 0) return shape(ctx, [], undefined, 0);
   assertFilteredForWrite(level, filters, "PATCH", ctx.allowUnfilteredViewWrites);
@@ -578,7 +818,11 @@ async function executeUpsert(ctx: WriteContext, level: Level): Promise<MutationR
   }
 
   const dropped = new Set<string>();
-  const changes = reconcileRow(ctx, level, bodyRows[0]!, dropped);
+  const { row: body, nested } = splitNestedBody(ctx, level, bodyRows[0]!, dropped);
+  const hasNested = nested.length > 0;
+  if (hasNested) assertNestedWriteSupported(ctx, "PUT", true);
+
+  const changes = reconcileRow(ctx, level, body, dropped);
 
   // Identity comes from the query-string filters; body values win where present.
   const identity: Record<string, unknown> = {};
@@ -614,6 +858,15 @@ async function executeUpsert(ctx: WriteContext, level: Level): Promise<MutationR
     ...pk.map((c: string) => sql`${sql.ref(c)}`.as(c)),
     sql`(xmax = 0)`.as(INSERTED_ALIAS),
   ];
+
+  if (hasNested) {
+    const result = await qb.returning(returnKeysAndInserted).execute();
+    const inserted = result.length > 0 ? result[0][INSERTED_ALIAS] === true : false;
+    const keys = result.map((row: any) => pick(row, pk));
+    if (keys.length > 0) await applyNestedWrites(ctx, level, keys, pk, nested, {});
+    const rows = wantsRepresentation(ctx) ? await reReadByKeys(ctx, level, keys, pk) : [];
+    return shape(ctx, rows, keys, keys.length, { inserted });
+  }
 
   if (!wantsRepresentation(ctx) || needsReRead(ctx.mutation.select)) {
     const result = await qb.returning(returnKeysAndInserted).execute();

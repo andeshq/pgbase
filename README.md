@@ -25,6 +25,7 @@ const pgbase = createPgbase({
 - **RLS-first** — every request runs in a transaction with `SET LOCAL ROLE`, a schema `search_path`, and the `request.jwt.claims`, `request.headers`, `request.cookies`, `request.method` and `request.path` GUCs.
 - **Reads** — `select` (aliases, casts, JSON paths), full operator set, `and`/`or`/`not`, `order`, `limit`/`offset`, `Range`, counts, singular objects, CSV.
 - **Writes** — `POST` (bulk), `PATCH`, `PUT` upsert, `DELETE`, with `Prefer: return=representation|minimal|headers-only`, `count`, `resolution`, `missing=default` and `handling=strict`.
+- **Nested writes** — insert and update related to-one, to-many and many-to-many rows in the same request and transaction.
 - **RPC** — `POST /rpc/<fn>` for functions and procedures, named or positional args, scalar and `SETOF`/`TABLE` returns, result `select`/filter/`order`/`limit`, and `Prefer: params=bulk`.
 - **Embedding** — to-one, to-many and many-to-many, nested, with `!hint` and `!inner`, compiled into a single SQL query with `json_agg` / `to_json`.
 - **Schema-aware** — introspects `pg_catalog` once, caches it, and validates tables/columns/relationships.
@@ -396,9 +397,33 @@ rows, propagates FK values, and inserts junction rows in the same transaction:
 
 The relation keys in the body use table names (not response aliases). Nested
 `POST` supports to-one, to-many, and many-to-many relationships and requires a
-primary key on the parent. It currently rejects `columns`, `on_conflict`, and
-conflict-resolution preferences with nested bodies. Nested `PATCH`/`PUT` is not
-implemented.
+primary key on the parent.
+
+`PATCH` and `PUT` accept the same nested shapes:
+
+```json
+{
+  "name": "Ada updated",
+  "books": [
+    { "id": 7, "title": "Renamed book" },
+    { "title": "New book" }
+  ]
+}
+```
+
+Nested update rules:
+
+- An embedded object that includes the related primary key updates that row.
+- An embedded object without the primary key inserts a new related row.
+- A to-one key can be `null` to detach a parent-owned foreign key.
+- Many-to-many elements update the related row and ensure the junction row exists.
+- Rows omitted from the payload are left untouched; nested writes never delete.
+- A key that does not belong to the parent (or does not exist) is rejected and
+  the whole request rolls back.
+
+Nested writes reject `columns`, conflict resolution, and `missing=default`, and
+`on_conflict` is only allowed for nested `PUT`. Everything runs in the request
+transaction, so a failure at any depth rolls back the whole request.
 
 - `POST` replies `201 Created` with a `Location` header pointing at the new row.
 - `PUT` replies `201` when it inserted and `200` when it updated.
@@ -535,4 +560,4 @@ The integration suite covers embedding (to-one/to-many/many-to-many), `!inner`, 
 - OpenAPI document at the service root.
 - Function overloading by argument type (`/rpc/fn` resolves by name only, so
   same-name overloads are not disambiguated).
-- Nested `PATCH`/`PUT`; nested writes are currently `POST` only.
+- Nested writes never delete omitted related rows.

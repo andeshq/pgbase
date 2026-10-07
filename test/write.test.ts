@@ -325,6 +325,145 @@ suite("writes against Postgres", () => {
     expect(await res.json()).toEqual([{ title: "Nested tags", tags: [{ name: "nested-tag" }] }]);
   });
 
+  test("nested PATCH updates existing children and inserts new ones", async () => {
+    const create = await call("/authors?select=id,name,books(id,title)", {
+      method: "POST",
+      body: JSON.stringify({ name: "Patch Parent", books: [{ title: "First" }, { title: "Second" }] }),
+      headers: { prefer: "return=representation" },
+    });
+    const [author] = (await create.json()) as any[];
+    const [first, second] = author.books;
+
+    const patch = await call(`/authors?id=eq.${author.id}&select=id,name,books(id,title)`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        name: "Patch Parent Updated",
+        books: [{ id: first.id, title: "First Renamed" }, { title: "Third" }],
+      }),
+      headers: { prefer: "return=representation" },
+    });
+    expect(patch.status).toBe(200);
+    const [patched] = (await patch.json()) as any[];
+    expect(patched.name).toBe("Patch Parent Updated");
+    const titles = new Map<number, string>(patched.books.map((book: any) => [book.id, book.title]));
+    expect(titles.get(first.id)).toBe("First Renamed");
+    expect(titles.get(second.id)).toBe("Second");
+    expect([...titles.values()].filter((title) => title === "Third")).toHaveLength(1);
+  });
+
+  test("nested PATCH cannot update a child owned by another parent", async () => {
+    const createA = await call("/authors?select=id,books(id,title)", {
+      method: "POST",
+      body: JSON.stringify({ name: "Owner A", books: [{ title: "A book" }] }),
+      headers: { prefer: "return=representation" },
+    });
+    const createB = await call("/authors?select=id,books(id,title)", {
+      method: "POST",
+      body: JSON.stringify({ name: "Owner B", books: [{ title: "B book" }] }),
+      headers: { prefer: "return=representation" },
+    });
+    const [ownerA] = (await createA.json()) as any[];
+    const [ownerB] = (await createB.json()) as any[];
+
+    const hijack = await call(`/authors?id=eq.${ownerA.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ books: [{ id: ownerB.books[0].id, title: "Hijacked" }] }),
+    });
+    expect(hijack.status).toBe(400);
+
+    const bBook = await client.query("select title from write_schema.books where id = $1", [ownerB.books[0].id]);
+    expect(bBook.rows[0].title).toBe("B book");
+    const aBook = await client.query("select title from write_schema.books where id = $1", [ownerA.books[0].id]);
+    expect(aBook.rows[0].title).toBe("A book");
+  });
+
+  test("nested PATCH updates a reverse one-to-one child", async () => {
+    const create = await call("/authors?select=id,author_profiles(id,bio)", {
+      method: "POST",
+      body: JSON.stringify({ name: "Profile Patch", author_profiles: { bio: "before" } }),
+      headers: { prefer: "return=representation" },
+    });
+    const [author] = (await create.json()) as any[];
+
+    const patch = await call(`/authors?id=eq.${author.id}&select=id,author_profiles(id,bio)`, {
+      method: "PATCH",
+      body: JSON.stringify({ author_profiles: { id: author.author_profiles.id, bio: "after" } }),
+      headers: { prefer: "return=representation" },
+    });
+    expect(patch.status).toBe(200);
+    const [patched] = (await patch.json()) as any[];
+    expect(patched.author_profiles.bio).toBe("after");
+  });
+
+  test("nested PATCH updates a parent-owned to-one relation", async () => {
+    const book = await call("/books?select=id,authors(id,name)", {
+      method: "POST",
+      body: JSON.stringify({ author_id: 1, title: "M2O Patch" }),
+      headers: { prefer: "return=representation" },
+    });
+    const [created] = (await book.json()) as any[];
+    const target = await call("/authors?select=id,name", {
+      method: "POST",
+      body: JSON.stringify({ name: "M2O Target" }),
+      headers: { prefer: "return=representation" },
+    });
+    const [targetAuthor] = (await target.json()) as any[];
+
+    const patch = await call(`/books?id=eq.${created.id}&select=id,title,authors(id,name)`, {
+      method: "PATCH",
+      body: JSON.stringify({ authors: { id: targetAuthor.id, name: "M2O Renamed" } }),
+      headers: { prefer: "return=representation" },
+    });
+    expect(patch.status).toBe(200);
+    const [patched] = (await patch.json()) as any[];
+    expect(patched.authors).toEqual({ id: targetAuthor.id, name: "M2O Renamed" });
+  });
+
+  test("nested PATCH updates and links many-to-many rows", async () => {
+    const create = await call("/books?select=id,tags(id,name)", {
+      method: "POST",
+      body: JSON.stringify({ author_id: 1, title: "M2M Patch", tags: [{ name: "m2m-one" }] }),
+      headers: { prefer: "return=representation" },
+    });
+    const [book] = (await create.json()) as any[];
+
+    const patch = await call(`/books?id=eq.${book.id}&select=id,tags(id,name)`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        tags: [{ id: book.tags[0].id, name: "m2m-one-renamed" }, { name: "m2m-two" }],
+      }),
+      headers: { prefer: "return=representation" },
+    });
+    expect(patch.status).toBe(200);
+    const [patched] = (await patch.json()) as any[];
+    expect(patched.tags.map((tag: any) => tag.name).sort()).toEqual(["m2m-one-renamed", "m2m-two"]);
+    const junctions = await client.query("select count(*)::int as n from write_schema.book_tags where book_id = $1", [book.id]);
+    expect(junctions.rows[0].n).toBe(2);
+  });
+
+  test("nested PUT upserts the parent and its children", async () => {
+    const create = await call("/authors?select=id,name,books(id,title)", {
+      method: "POST",
+      body: JSON.stringify({ name: "Put Parent", books: [{ title: "Put First" }] }),
+      headers: { prefer: "return=representation" },
+    });
+    const [author] = (await create.json()) as any[];
+
+    const put = await call(`/authors?id=eq.${author.id}&select=id,name,books(id,title)`, {
+      method: "PUT",
+      body: JSON.stringify({
+        id: author.id,
+        name: "Put Parent Updated",
+        books: [{ id: author.books[0].id, title: "Put First Updated" }, { title: "Put Second" }],
+      }),
+      headers: { prefer: "return=representation" },
+    });
+    expect(put.status).toBe(200);
+    const [patched] = (await put.json()) as any[];
+    expect(patched.name).toBe("Put Parent Updated");
+    expect(patched.books.map((entry: any) => entry.title).sort()).toEqual(["Put First Updated", "Put Second"]);
+  });
+
   test("unknown columns are dropped, strict handling throws", async () => {
     const lenient = await call("/books", {
       method: "POST",

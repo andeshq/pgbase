@@ -855,6 +855,28 @@ suite("PostgREST parity", () => {
     });
   });
 
+  // -- Filters --------------------------------------------------------------
+
+  describe("filters (AndOrParamsSpec, QuerySpec)", () => {
+    test("like and ilike treat * as a wildcard alias for %", async () => {
+      const like = await call("/range_items?select=id&label=like.r*&order=id");
+      expect((await json(like)).map((row: any) => row.id)).toEqual([1, 2, 3, 4, 5]);
+
+      const ilike = await call("/range_items?select=id&label=ilike.R1");
+      expect(await json(ilike)).toEqual([{ id: 1 }]);
+    });
+
+    test("and/or combine with traditional filters", async () => {
+      const res = await call("/range_items?select=id&or=(id.eq.1,id.eq.3)&id=lt.5&order=id");
+      expect((await json(res)).map((row: any) => row.id)).toEqual([1, 3]);
+    });
+
+    test("in accepts a quoted list", async () => {
+      const res = await call("/range_items?select=id&id=in.(1,2)&order=id");
+      expect((await json(res)).map((row: any) => row.id)).toEqual([1, 2]);
+    });
+  });
+
   // -- RollbackSpec ---------------------------------------------------------
 
   describe("stability (RollbackSpec)", () => {

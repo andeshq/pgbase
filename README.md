@@ -355,6 +355,9 @@ to-many or nested spread requests are rejected rather than silently reshaped.
 | `fts` `plfts` `phfts` `wfts` | `to_tsquery` `plainto_tsquery` `phraseto_tsquery` `websearch_to_tsquery` |
 | `not.<op>` | negates any operator |
 
+For `like`/`ilike`, `*` is accepted as an alias for `%` in the pattern, so
+`?title=like.*Al*` does not need URL-encoding.
+
 ### Logic
 
 ```

@@ -85,6 +85,14 @@ describe("SQL compilation", () => {
     expect(compiled.parameters).toContain("isbn");
   });
 
+  test("like and ilike treat * as a wildcard alias for %", () => {
+    const like = buildReadQuery(ctxFor("http://localhost/books?title=like.*Al*")).compile();
+    expect(like.parameters).toContain("%Al%");
+
+    const ilike = buildReadQuery(ctxFor("http://localhost/books?title=ilike.*al*")).compile();
+    expect(ilike.parameters).toContain("%al%");
+  });
+
   test("to-one embed uses jsonObjectFrom", () => {
     const compiled = buildReadQuery(
       ctxFor("http://localhost/books?select=title,author:authors(name)"),

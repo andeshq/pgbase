@@ -120,6 +120,13 @@ function renderOpFilter(filter: OpFilter, level: QueryLevel): RawBuilder<any> {
     return filter.negate ? sql`not (${expr})` : expr;
   }
 
+  // PostgREST treats `*` as an alias for `%` in like/ilike patterns.
+  if (filter.op === "like" || filter.op === "ilike") {
+    const pattern = String(filter.value).replace(/\*/g, "%");
+    const expr = sql`${lhs} ${sql.raw(SCALAR_SYMBOLS[filter.op]!)} ${pattern}`;
+    return filter.negate ? sql`not (${expr})` : expr;
+  }
+
   const symbol = SCALAR_SYMBOLS[filter.op];
   if (!symbol) throw PgbaseError.parse(`unsupported operator: ${filter.op}`);
   const expr = sql`${lhs} ${sql.raw(symbol)} ${filter.value}`;

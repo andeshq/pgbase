@@ -10,7 +10,7 @@ import { applySession } from "./session.ts";
 import { startSchemaListener, type NotifyListener } from "./schema-listener.ts";
 import { normalizeBasePath, matchBasePath, firstSchema, isWriteMethod } from "./routing.ts";
 import type { Pgbase, PgbaseConfig, PgbaseContext, PgbaseRelation, PgbaseSchema, PgbaseSession } from "./types.ts";
-import type { WriteMethod, PreferOptions } from "./ast.ts";
+import type { WriteMethod, PreferOptions, ParsedRpc } from "./ast.ts";
 
 function rootResponse(schema: PgbaseSchema): Response {
   return Response.json({
@@ -447,6 +447,18 @@ async function runWrite(
   };
 }
 
+/**
+ * Argument names the client supplied, used in the PGRST202 message. A JSON
+ * POST body provides the keys; GET/HEAD uses the query-string keys (minus
+ * control params and positional path segments).
+ */
+function rpcArgumentKeys(parsed: ParsedRpc, method: string, body: unknown): string[] {
+  if (method === "POST" && body !== null && typeof body === "object" && !Array.isArray(body)) {
+    return Object.keys(body as Record<string, unknown>);
+  }
+  return Object.keys(parsed.queryArgs).filter((key) => key !== "__pathArgs");
+}
+
 async function handleRpc(
   runtime: Runtime,
   nameArg: string,
@@ -459,8 +471,29 @@ async function handleRpc(
   const parsed = parseRpc(request, runtime.schemaName, nameArg, runtime.txAllowOverride);
   ctx.table = parsed.fn;
 
+  // Parse the body up front: it also supplies the argument keys reported when
+  // the function cannot be resolved, and `params=bulk` needs its length.
+  let body: unknown = null;
+  if (method === "POST") {
+    const text = await readBodyText(request, runtime.maxBodyBytes);
+    if (text.trim() !== "") {
+      try {
+        body = JSON.parse(text);
+      } catch {
+        return errorResponse(PgbaseError.parse("Failed to parse the request body as JSON"));
+      }
+    }
+  }
+
   const fn = schema.functions.get(parsed.fn);
-  if (!fn) return errorResponse(PgbaseError.functionNotFound(parsed.fn));
+  if (!fn) {
+    return errorResponse(
+      PgbaseError.functionNotFound(parsed.schema, parsed.fn, {
+        argumentKeys: rpcArgumentKeys(parsed, method, body),
+        isJsonPost: method === "POST",
+      }),
+    );
+  }
   parsed.readOnly = fn.volatility !== "v";
 
   if (method === "OPTIONS") {
@@ -493,19 +526,6 @@ async function handleRpc(
     }
   } else if (method !== "POST") {
     return errorResponse(PgbaseError.methodNotAllowed(request.method));
-  }
-
-  // Parse the body up front so `params=bulk` knows how many invocations to run.
-  let body: unknown = null;
-  if (method === "POST") {
-    const text = await readBodyText(request, runtime.maxBodyBytes);
-    if (text.trim() !== "") {
-      try {
-        body = JSON.parse(text);
-      } catch {
-        return errorResponse(PgbaseError.parse("Failed to parse the request body as JSON"));
-      }
-    }
   }
 
   const path = `rpc/${nameArg}`;

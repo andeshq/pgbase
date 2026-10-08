@@ -177,13 +177,30 @@ export class PgbaseError extends Error {
     return new PgbaseError("PGRST124", message, 400);
   }
 
-  static functionNotFound(fn: string, hint?: string) {
+  /**
+   * PGRST202. `argumentKeys` are the argument names the client supplied; like
+   * PostgREST, they are reported sorted, both in the message and in the
+   * `details` search description.
+   */
+  static functionNotFound(
+    schema: string,
+    fn: string,
+    options: { argumentKeys?: string[]; isJsonPost?: boolean; hint?: string } = {},
+  ) {
+    const keys = [...(options.argumentKeys ?? [])].sort();
+    const signature = keys.length === 0 ? " without parameters" : `(${keys.join(", ")})`;
+    const searched =
+      keys.length === 0
+        ? " without parameters"
+        : ` with parameter${keys.length > 1 ? "s" : " "}${keys.join(", ")}`;
     return new PgbaseError(
       "PGRST202",
-      `Could not find the function public.${fn} with the specified parameters in the schema cache`,
+      `Could not find the function ${schema}.${fn}${signature} in the schema cache`,
       404,
-      null,
-      hint ?? null,
+      `Searched for the function ${schema}.${fn}${searched}${
+        options.isJsonPost ? " or with a single unnamed json/jsonb parameter" : ""
+      }, but no matches were found in the schema cache.`,
+      options.hint ?? null,
     );
   }
 

@@ -212,16 +212,39 @@ suite("RPC against Postgres", () => {
     expect(rows.rows[0].n).toBe(0);
   });
 
-  test("missing required argument is 404 PGRST202", async () => {
+  test("missing required argument is 404 PGRST202 with the exposed schema", async () => {
     const res = await call("/rpc/add", { method: "POST", body: JSON.stringify({ b: 3 }) });
     expect(res.status).toBe(404);
-    expect(((await res.json()) as any).code).toBe("PGRST202");
+    const body = (await res.json()) as any;
+    expect(body.code).toBe("PGRST202");
+    // The schema is the exposed one (`api`), never a hardcoded `public`.
+    expect(body.message).toBe("Could not find the function api.add(b) in the schema cache");
+    expect(body.details).toBe(
+      "Searched for the function api.add with parameter b or with a single unnamed json/jsonb parameter, but no matches were found in the schema cache.",
+    );
+    expect(body.hint).toBe("Perhaps you meant to call the function api.add(a, b)");
   });
 
   test("unknown function is 404 PGRST202", async () => {
     const res = await call("/rpc/nope", { method: "POST", body: "{}" });
     expect(res.status).toBe(404);
-    expect(((await res.json()) as any).code).toBe("PGRST202");
+    const body = (await res.json()) as any;
+    expect(body.code).toBe("PGRST202");
+    expect(body.message).toBe("Could not find the function api.nope without parameters in the schema cache");
+    expect(body.details).toBe(
+      "Searched for the function api.nope without parameters or with a single unnamed json/jsonb parameter, but no matches were found in the schema cache.",
+    );
+    expect(body.hint).toBeNull();
+  });
+
+  test("unknown function on GET omits the json body alternative", async () => {
+    const res = await call("/rpc/nope?x=1");
+    expect(res.status).toBe(404);
+    const body = (await res.json()) as any;
+    expect(body.message).toBe("Could not find the function api.nope(x) in the schema cache");
+    expect(body.details).toBe(
+      "Searched for the function api.nope with parameter x, but no matches were found in the schema cache.",
+    );
   });
 
   test("singular accept returns the bare object/value", async () => {

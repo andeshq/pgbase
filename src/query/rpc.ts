@@ -68,23 +68,34 @@ function buildCallExpression(fn: PgbaseFunction, call: CallArgs): ReturnType<typ
   return sql`${target}(${sql.join(args)})`;
 }
 
-function assertArgs(fn: PgbaseFunction, call: CallArgs): void {
+function assertArgs(fn: PgbaseFunction, call: CallArgs, method: string): void {
+  const isJsonPost = method === "POST";
   if (call.positional) {
     if (call.positional.length < fn.requiredArgCount) {
-      throw PgbaseError.functionNotFound(fn.name);
+      throw PgbaseError.functionNotFound(fn.schema, fn.name, { isJsonPost });
     }
     return;
   }
   for (const arg of fn.args) {
     const provided = Object.prototype.hasOwnProperty.call(call.named, arg.name);
-    if (!provided && !arg.hasDefault) throw PgbaseError.functionNotFound(fn.name);
+    if (!provided && !arg.hasDefault) {
+      // The function exists but the supplied arguments don't resolve it, so
+      // suggest its actual signature (PostgREST does the same when fuzzy
+      // matching finds a close candidate).
+      const signature = [...fn.args].map((entry) => entry.name).sort().join(", ");
+      throw PgbaseError.functionNotFound(fn.schema, fn.name, {
+        argumentKeys: Object.keys(call.named),
+        isJsonPost,
+        hint: `Perhaps you meant to call the function ${fn.schema}.${fn.name}(${signature})`,
+      });
+    }
   }
 }
 
 export async function executeRpc(ctx: RpcContext, method: string, body: unknown): Promise<RpcResult> {
   const fn = ctx.fn;
   const call = resolveCall(ctx, body, method);
-  assertArgs(fn, call);
+  assertArgs(fn, call, method);
 
   const fnCall = buildCallExpression(fn, call);
 

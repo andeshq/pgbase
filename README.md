@@ -482,7 +482,9 @@ Prefer: params=bulk                [{"a":1},{"a":2}]   # -> [2,3]
 - A query-string key is treated as a **function argument** when it matches a
   declared parameter name; any other key is a **result filter**.
 - Calling a function with missing required arguments, or an unknown function,
-  returns `404` with code `PGRST202`.
+  returns `404 PGRST202` with the exposed schema in the message (e.g.
+  `Could not find the function api.add(b) in the schema cache`), a `details`
+  search description, and a signature hint when the function exists.
 
 ### Ordering, pagination, counts, formats
 

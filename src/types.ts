@@ -153,6 +153,13 @@ export interface PgbaseConfig<DB = unknown> {
   /** Permit unfiltered PATCH/DELETE on updatable views. Defaults to false. */
   allowUnfilteredViewWrites?: boolean;
   /**
+   * How the request transaction ends. Mirrors PostgREST's `db-tx-end`:
+   * `"commit"` (default) ignores `Prefer: tx=...`; `"commit-allow-override"`
+   * honors `tx=rollback`; `"rollback"` always rolls back; and
+   * `"rollback-allow-override"` rolls back unless `tx=commit` is sent.
+   */
+  transactionEnd?: "commit" | "rollback" | "commit-allow-override" | "rollback-allow-override";
+  /**
    * Role used when `getSession` returns `null`. Mirrors PostgREST's
    * `db-anon-role`.
    *

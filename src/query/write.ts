@@ -68,6 +68,71 @@ function resolutionApplies(ctx: WriteContext, level: Level): boolean {
   return (target?.length ?? 0) > 0;
 }
 
+/** True when `resolution=merge-duplicates` will actually be applied. */
+function mergeResolutionApplies(ctx: WriteContext, level: Level): boolean {
+  return ctx.mutation.prefer.resolution === "merge-duplicates" && resolutionApplies(ctx, level);
+}
+
+/** `RETURNING (xmax = 0)` tells an insert apart from a conflict update. */
+const INSERTED_EXPRESSION = sql`(xmax = 0)`.as(INSERTED_ALIAS);
+
+/**
+ * PostgREST parses array payloads with `json_to_recordset`, so every element
+ * must coerce to its column types even when only one of them is applied. This
+ * matters for PATCH (the first element wins) and PUT (the element matching the
+ * URL wins): an invalid unused element is still a 400.
+ */
+async function assertRecordsetCoercible(
+  ctx: WriteContext,
+  level: Level,
+  rows: Array<Record<string, unknown>>,
+): Promise<void> {
+  const names = new Set<string>();
+  for (const row of rows) {
+    for (const key of Object.keys(row)) {
+      const column = key.trim();
+      if (ctx.mutation.columns && !ctx.mutation.columns.includes(column)) continue;
+      if (level.relation.columnMap.has(column)) names.add(column);
+    }
+  }
+  if (names.size === 0) return;
+  const fields = [...names].map((name) => {
+    const column = level.relation.columnMap.get(name)!;
+    return sql`${sql.id(name)} ${sql.raw(column.udt)}`;
+  });
+  await sql`select * from jsonb_to_recordset(${JSON.stringify(rows)}::jsonb) as _(${sql.join(fields)})`.execute(ctx.db);
+}
+
+/**
+ * PUT applies the array element whose primary key matches the URL filters
+ * (PostgREST filters the recordset with a WHERE on `pgrst_body`). A single
+ * object keeps the permissive URL-identity fallback.
+ */
+function selectUpsertBody(
+  rows: Array<Record<string, unknown>>,
+  pk: string[],
+  identity: Record<string, unknown>,
+): Record<string, unknown> {
+  if (rows.length === 1) return rows[0]!;
+  const matches = rows.filter((row) =>
+    pk.every((column) => {
+      const provided = row[column];
+      return provided !== undefined && String(provided) === String(identity[column]);
+    }),
+  );
+  if (matches.length > 1) {
+    // PostgreSQL rejects `ON CONFLICT DO UPDATE` affecting a row twice.
+    throw new PgbaseError(
+      "21000",
+      "ON CONFLICT DO UPDATE command cannot affect row a second time",
+      500,
+      null,
+      "Ensure that no rows proposed for insertion within the same command have duplicate constrained values.",
+    );
+  }
+  return matches[0] ?? rows[0]!;
+}
+
 /** `?columns=` must name real columns, mirroring PostgREST's PGRST204. */
 function assertColumnsExist(ctx: WriteContext, level: Level): void {
   if (!ctx.mutation.columns) return;
@@ -320,19 +385,35 @@ async function executeInsert(ctx: WriteContext, level: Level): Promise<MutationR
   let qb: any = ctx.db.insertInto(level.name).values(rows);
   const insertColumns = allEmpty ? [] : [...new Set(rows.flatMap((row) => Object.keys(row)))];
   qb = applyConflict(ctx, level, qb, insertColumns);
+  const mergeDups = mergeResolutionApplies(ctx, level);
+  const insertedFrom = (result: any[]): boolean | undefined =>
+    mergeDups ? result.some((row: any) => row[INSERTED_ALIAS] === true) : undefined;
 
   if (!wantsRepresentation(ctx) && ctx.mutation.prefer.return !== "headers-only") {
-    const result = await qb.executeTakeFirst();
-    return shape(ctx, [], undefined, affectedRows(result));
+    if (!mergeDups) {
+      const result = await qb.executeTakeFirst();
+      return shape(ctx, [], undefined, affectedRows(result));
+    }
+    // Count real inserts (`xmax = 0`): an update leaves `xmax` set. This is
+    // what makes an all-update merge-duplicates reply 200 instead of 201.
+    const result = await qb.returning([INSERTED_EXPRESSION]).execute();
+    return shape(ctx, [], undefined, result.length, { inserted: insertedFrom(result) });
   }
 
   if (!wantsRepresentation(ctx)) {
     if (!pk) {
-      const result = await qb.executeTakeFirst();
-      return shape(ctx, [], undefined, affectedRows(result));
+      if (!mergeDups) {
+        const result = await qb.executeTakeFirst();
+        return shape(ctx, [], undefined, affectedRows(result));
+      }
+      const result = await qb.returning([INSERTED_EXPRESSION]).execute();
+      return shape(ctx, [], undefined, result.length, { inserted: insertedFrom(result) });
     }
-    const result = await qb.returning(returnKeys).execute();
-    return shape(ctx, [], result, result.length);
+    const result = await qb
+      .returning(mergeDups ? [...returnKeys, INSERTED_EXPRESSION] : returnKeys)
+      .execute();
+    const keys = result.map((row: any) => pick(row, pk));
+    return shape(ctx, [], keys, result.length, { inserted: insertedFrom(result) });
   }
 
   if (needsReRead(ctx.mutation.select)) {
@@ -341,13 +422,21 @@ async function executeInsert(ctx: WriteContext, level: Level): Promise<MutationR
         `Cannot return embedded representation for '${level.relation.name}' without a primary key`,
       );
     }
-    const inserted = await qb.returning(returnKeys).execute();
-    const responseRows = inserted.length > 0 ? await reReadByKeys(ctx, level, inserted) : [];
-    return shape(ctx, responseRows, inserted, inserted.length);
+    const insertedRows = await qb
+      .returning(mergeDups ? [...returnKeys, INSERTED_EXPRESSION] : returnKeys)
+      .execute();
+    const keys = insertedRows.map((row: any) => pick(row, pk));
+    const responseRows = keys.length > 0 ? await reReadByKeys(ctx, level, keys) : [];
+    return shape(ctx, responseRows, keys, insertedRows.length, { inserted: insertedFrom(insertedRows) });
   }
 
-  const result = await qb.returning(returningClause(ctx, level)).execute();
-  return shape(ctx, result, pk ? result.map((row: any) => pick(row, pk)) : undefined, result.length);
+  const selection = mergeDups
+    ? [...(returningClause(ctx, level) as any[]), INSERTED_EXPRESSION]
+    : (returningClause(ctx, level) as any[]);
+  const result = await qb.returning(selection).execute();
+  const rowsOut = mergeDups ? result.map((row: any) => stripInserted(row)) : result;
+  const keys = pk ? result.map((row: any) => pick(row, pk)) : undefined;
+  return shape(ctx, rowsOut, keys, result.length, { inserted: insertedFrom(result) });
 }
 
 interface NestedBodyField {
@@ -796,6 +885,9 @@ async function executeUpdate(ctx: WriteContext, level: Level): Promise<MutationR
   const bodyRows = await readBodyRows(ctx);
   // `{}`, `[]` and `[{}]` are all no-op patches in PostgREST.
   if (bodyRows.length === 0) return shape(ctx, [], undefined, 0);
+  // PostgREST parses the whole array with `json_to_recordset`; extra elements
+  // are not applied but must still coerce (the first element wins).
+  if (bodyRows.length > 1) await assertRecordsetCoercible(ctx, level, bodyRows);
   const dropped = new Set<string>();
   const { row: body, nested } = splitNestedBody(ctx, level, bodyRows[0]!, dropped);
   const filters = ctx.mutation.filters;
@@ -874,8 +966,14 @@ async function executeUpsert(ctx: WriteContext, level: Level): Promise<MutationR
 
   const bodyRows = await readBodyRows(ctx);
   if (bodyRows.length === 0) throw PgbaseError.putMatchingPk();
-  const body = bodyRows[0]!;
   const target = ctx.mutation.onConflict ?? pk;
+
+  // Identity comes from the query-string filters; body values win where present.
+  const identity: Record<string, unknown> = {};
+  for (const eq of equalityFilters(ctx.mutation.filters)) identity[eq.column] = eq.value;
+
+  if (bodyRows.length > 1) await assertRecordsetCoercible(ctx, level, bodyRows);
+  const body = selectUpsertBody(bodyRows, pk, identity);
 
   const dropped = new Set<string>();
   const { row: reconciled, nested } = splitNestedBody(ctx, level, body, dropped);
@@ -883,10 +981,6 @@ async function executeUpsert(ctx: WriteContext, level: Level): Promise<MutationR
   if (hasNested) assertNestedWriteSupported(ctx, "PUT", true);
 
   const changes = reconcileRow(ctx, level, reconciled, dropped);
-
-  // Identity comes from the query-string filters; body values win where present.
-  const identity: Record<string, unknown> = {};
-  for (const eq of equalityFilters(ctx.mutation.filters)) identity[eq.column] = eq.value;
 
   const provided: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(body)) provided[key.trim()] = value;

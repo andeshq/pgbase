@@ -241,4 +241,15 @@ describe("parsePrefer", () => {
     expect(prefer.missing).toBe("null");
     expect(prefer.invalid).toEqual([]);
   });
+
+  test("tx is only parsed when overrides are allowed", () => {
+    expect(parsePrefer("tx=rollback").transaction).toBeNull();
+    expect(parsePrefer("tx=rollback", true).transaction).toBe("rollback");
+  });
+
+  test("timezone is captured for the session", () => {
+    const prefer = parsePrefer("timezone=America/Los_Angeles");
+    expect(prefer.timezone).toBe("America/Los_Angeles");
+    expect(prefer.invalid).toEqual([]);
+  });
 });

@@ -1,8 +1,8 @@
-import { type Kysely } from "kysely";
+import { type Kysely, sql } from "kysely";
 import { PgbaseError } from "./errors.ts";
 import { parseMutation, parseRequest, parseRpc } from "./parse/request.ts";
 import { executeRead, type BaseContext } from "./query/compile.ts";
-import { executeMutation } from "./query/write.ts";
+import { assertMaxAffected, executeMutation } from "./query/write.ts";
 import { executeRpc } from "./query/rpc.ts";
 import { buildResponse, buildRpcResponse, buildWriteResponse, errorResponse, VARY } from "./response.ts";
 import { introspect } from "./schema/index.ts";
@@ -10,7 +10,7 @@ import { applySession } from "./session.ts";
 import { startSchemaListener, type NotifyListener } from "./schema-listener.ts";
 import { normalizeBasePath, matchBasePath, firstSchema, isWriteMethod } from "./routing.ts";
 import type { Pgbase, PgbaseConfig, PgbaseContext, PgbaseRelation, PgbaseSchema, PgbaseSession } from "./types.ts";
-import type { WriteMethod } from "./ast.ts";
+import type { WriteMethod, PreferOptions } from "./ast.ts";
 
 function rootResponse(schema: PgbaseSchema): Response {
   return Response.json({
@@ -55,6 +55,64 @@ interface Runtime {
   allowUnfilteredViewWrites: boolean;
   settings: Record<string, string | number>;
   verbosity: "verbose" | "minimal";
+  transactionEnd: NonNullable<PgbaseConfig<any>["transactionEnd"]>;
+  txAllowOverride: boolean;
+}
+
+const TRANSACTION_END = new Set([
+  "commit",
+  "rollback",
+  "commit-allow-override",
+  "rollback-allow-override",
+]);
+
+/** `Prefer: tx=...` is only parsed when the config permits overrides. */
+function shouldRollback(
+  transactionEnd: Runtime["transactionEnd"],
+  prefer: PreferOptions,
+): boolean {
+  switch (transactionEnd) {
+    case "rollback":
+      return true;
+    case "rollback-allow-override":
+      return prefer.transaction !== "commit";
+    case "commit-allow-override":
+      return prefer.transaction === "rollback";
+    default:
+      return false;
+  }
+}
+
+const ROLLBACK_SIGNAL = new Error("pgbase: rollback requested");
+
+/**
+ * Run `operation` in a transaction, honoring `Prefer: tx=rollback` (and the
+ * configured default). A requested rollback still returns the operation's
+ * result, mirroring PostgREST: the response is built as if it committed.
+ */
+async function runTransaction<T>(
+  runtime: Runtime,
+  prefer: PreferOptions,
+  operation: (trx: any) => Promise<T>,
+): Promise<T> {
+  if (!shouldRollback(runtime.transactionEnd, prefer)) {
+    return runtime.config.database.transaction().execute(operation);
+  }
+  let value: T | undefined;
+  let rolledBack = false;
+  try {
+    return await runtime.config.database.transaction().execute(async (trx) => {
+      const result = await operation(trx);
+      // Surface deferred constraint violations before rolling back.
+      await sql`set constraints all immediate`.execute(trx);
+      value = result;
+      rolledBack = true;
+      throw ROLLBACK_SIGNAL;
+    });
+  } catch (error) {
+    if (rolledBack) return value as T;
+    throw error;
+  }
 }
 
 /** Resolve the request's identity once, before opening a transaction. */
@@ -95,6 +153,7 @@ async function withSession<T>(
   path: string,
   session: PgbaseSession | null,
   bodyText: string | undefined,
+  timezone: string | null,
   operation: (base: BaseContext) => Promise<T>,
 ): Promise<T> {
   await applySession(
@@ -105,6 +164,7 @@ async function withSession<T>(
     request,
     path,
     runtime.settings,
+    timezone,
   );
   return operation({
     db: trx,
@@ -179,6 +239,13 @@ export function createPgbase<DB = unknown>(config: PgbaseConfig<DB>): Pgbase<DB>
     );
   }
 
+  const transactionEnd = config.transactionEnd ?? "commit";
+  if (!TRANSACTION_END.has(transactionEnd)) {
+    throw new Error(
+      `pgbase: invalid transactionEnd '${transactionEnd}'. Use "commit", "rollback", "commit-allow-override" or "rollback-allow-override"`,
+    );
+  }
+
   const runtime: Runtime = {
     config: config as PgbaseConfig<any>,
     schemaName,
@@ -190,6 +257,8 @@ export function createPgbase<DB = unknown>(config: PgbaseConfig<DB>): Pgbase<DB>
     allowUnfilteredViewWrites: config.allowUnfilteredViewWrites ?? false,
     settings: config.settings ?? {},
     verbosity: config.errorVerbosity ?? "verbose",
+    transactionEnd,
+    txAllowOverride: transactionEnd.endsWith("allow-override"),
   };
 
   let schemaPromise: Promise<PgbaseSchema> | null = null;
@@ -347,9 +416,9 @@ async function runRead(
     return { response: errorResponse(PgbaseError.methodNotAllowed(request.method)), rows: 0 };
   }
 
-  const parsed = parseRequest(request, runtime.schemaName, table);
-  const result = await runtime.config.database.transaction().execute((trx) =>
-    withSession(runtime, trx, request, ctx, path, session, undefined, (exec) =>
+  const parsed = parseRequest(request, runtime.schemaName, table, runtime.txAllowOverride);
+  const result = await runTransaction(runtime, parsed.prefer, (trx) =>
+    withSession(runtime, trx, request, ctx, path, session, undefined, parsed.prefer.timezone, (exec) =>
       executeRead({ ...exec, request: parsed }),
     ),
   );
@@ -366,9 +435,9 @@ async function runWrite(
   session: PgbaseSession | null,
 ): Promise<{ response: Response; rows: number }> {
   const bodyText = await readBodyText(request, runtime.maxBodyBytes);
-  const mutation = parseMutation(request, runtime.schemaName, table, method);
-  const result = await runtime.config.database.transaction().execute((trx) =>
-    withSession(runtime, trx, request, ctx, path, session, bodyText, (exec) =>
+  const mutation = parseMutation(request, runtime.schemaName, table, method, runtime.txAllowOverride);
+  const result = await runTransaction(runtime, mutation.prefer, (trx) =>
+    withSession(runtime, trx, request, ctx, path, session, bodyText, mutation.prefer.timezone, (exec) =>
       executeMutation({ ...exec, request: mutation, mutation, bodyText }),
     ),
   );
@@ -387,7 +456,7 @@ async function handleRpc(
   session: PgbaseSession | null,
 ): Promise<Response> {
   const schema = ctx.schema;
-  const parsed = parseRpc(request, runtime.schemaName, nameArg);
+  const parsed = parseRpc(request, runtime.schemaName, nameArg, runtime.txAllowOverride);
   ctx.table = parsed.fn;
 
   const fn = schema.functions.get(parsed.fn);
@@ -441,15 +510,15 @@ async function handleRpc(
 
   const path = `rpc/${nameArg}`;
   const invoke = (trx: any, rpcIndex?: number) =>
-    withSession(runtime, trx, request, ctx, path, session, undefined, (exec) =>
+    withSession(runtime, trx, request, ctx, path, session, undefined, parsed.prefer.timezone, (exec) =>
       executeRpc({ ...exec, request: parsed, rpc: parsed, fn, rpcIndex }, method, body),
     );
 
   // `Prefer: params=bulk` invokes the function once per array element.
   if (parsed.params === "bulk" && Array.isArray(body)) {
     parsed.bulkArgs = body as Array<Record<string, unknown>>;
-    const collected = await runtime.config.database.transaction().execute((trx) =>
-      withSession(runtime, trx, request, ctx, path, session, undefined, async (exec) => {
+    const collected = await runTransaction(runtime, parsed.prefer, (trx) =>
+      withSession(runtime, trx, request, ctx, path, session, undefined, parsed.prefer.timezone, async (exec) => {
         const rows: any[] = [];
         for (let i = 0; i < body.length; i++) {
           const result = await executeRpc(
@@ -459,12 +528,15 @@ async function handleRpc(
           );
           rows.push(...result.rows);
         }
+        // Bulk invocations share one transaction, so `max-affected` applies to
+        // the total number of rows they return.
+        assertMaxAffected(parsed.prefer, rows.length);
         return rows;
       }),
     );
     return buildRpcResponse(parsed, { rows: collected, count: parsed.count ? collected.length : null }, method);
   }
 
-  const result = await runtime.config.database.transaction().execute((trx) => invoke(trx));
+  const result = await runTransaction(runtime, parsed.prefer, (trx) => invoke(trx));
   return buildRpcResponse(parsed, result, method);
 }

@@ -87,6 +87,10 @@ export interface PreferOptions {
   missing: "default" | "null" | null;
   handling: "strict" | "lenient" | null;
   params: "single-object" | "bulk";
+  /** `Prefer: tx=commit|rollback`, parsed only when the config allows overrides. */
+  transaction: "commit" | "rollback" | null;
+  /** `Prefer: timezone=<tz>`, applied with `set_config('timezone', ...)`. */
+  timezone: string | null;
   /** `Prefer: max-affected=N`; enforced for PATCH/DELETE/RPC with handling=strict. */
   maxAffected: number | null;
   /** Unrecognized preference tokens; rejected only with handling=strict. */

@@ -46,6 +46,7 @@ export async function applySession(
   request: Request,
   path: string,
   settings: Record<string, string | number> = {},
+  timezone: string | null = null,
 ): Promise<void> {
   if (role) {
     await sql`set local role ${sql.id(role)}`.execute(trx);
@@ -58,6 +59,11 @@ export async function applySession(
     sql`set_config('request.method', ${request.method.toUpperCase()}, true)`,
     sql`set_config('request.path', ${path}, true)`,
   ];
+
+  if (timezone) {
+    // `Prefer: timezone=` applies for the duration of the transaction.
+    setters.push(sql`set_config('timezone', ${timezone}, true)`);
+  }
 
   for (const [name, value] of Object.entries(settings)) {
     if (!/^[A-Za-z_][A-Za-z0-9_.]*$/.test(name)) continue;

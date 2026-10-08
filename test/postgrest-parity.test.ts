@@ -46,6 +46,7 @@ create table tiobe (name text primary key, rank int);
 create table range_items (id int primary key, label text not null);
 create table bulk_items (id int primary key, name text not null);
 create table ma_items (id int primary key, name text not null);
+create table upsert_status (name text primary key, rank int);
 create table authors (id serial primary key, name text not null);
 create table books (
   id serial primary key,
@@ -57,6 +58,7 @@ create function scalar_answer() returns int language sql immutable as $$ select 
 create function many_items(n int) returns setof range_items
   language sql stable as $$ select * from range_items order by id limit n $$;
 create function volatile_fn() returns int language plpgsql volatile as $$ begin return 1; end $$;
+create function tz_probe() returns text language sql stable as $$ select current_setting('timezone') $$;
 
 create view read_only_view as select count(*)::int as n from no_pk;
 
@@ -67,6 +69,7 @@ grant execute on all functions in schema parity to anon, authenticated;
 insert into items (name) values ('one'), ('two'), ('three');
 insert into compound values (1, 1, 'one-one'), (1, 2, 'one-two');
 insert into tiobe values ('Java', 1), ('C', 2);
+insert into upsert_status values ('existing', 1);
 insert into range_items values (1, 'r1'), (2, 'r2'), (3, 'r3'), (4, 'r4'), (5, 'r5');
 insert into ma_items values (1, 'm1'), (2, 'm2'), (3, 'm3');
 insert into authors (name) values ('Ada');
@@ -78,14 +81,21 @@ suite("PostgREST parity", () => {
   let pool: Pool;
   let db: Kysely<any>;
   let pgbase: ReturnType<typeof createPgbase>;
+  let baseConfig: Record<string, unknown>;
 
-  const call = (path: string, init?: RequestInit) =>
-    pgbase.handler(
+  const callWith = (
+    instance: ReturnType<typeof createPgbase>,
+    path: string,
+    init?: RequestInit,
+  ) =>
+    instance.handler(
       new Request(`http://localhost/rest${path}`, {
         ...init,
         headers: { "content-type": "application/json", ...(init?.headers as any) },
       }),
     );
+
+  const call = (path: string, init?: RequestInit) => callWith(pgbase, path, init);
 
   const json = (res: Response): Promise<any> => res.json() as Promise<any>;
 
@@ -96,12 +106,13 @@ suite("PostgREST parity", () => {
 
     pool = new Pool({ connectionString: DATABASE_URL, max: 4 });
     db = new Kysely<any>({ dialect: new PostgresDialect({ pool }) });
-    pgbase = createPgbase({
+    baseConfig = {
       database: db,
       schemaName: "parity",
       basePath: "/rest",
       getSession: () => ({ role: "authenticated" }),
-    } as any);
+    };
+    pgbase = createPgbase(baseConfig as any);
   });
 
   afterAll(async () => {
@@ -679,6 +690,208 @@ suite("PostgREST parity", () => {
       expect(body.message).toBe(
         "Function must return SETOF or TABLE when max-affected preference is used with handling=strict",
       );
+    });
+  });
+
+  // -- UpsertSpec / UpdateSpec: array payloads and merge-duplicates statuses ---
+
+  describe("array payloads and upsert statuses", () => {
+    test("an all-update merge-duplicates is 200, a mixed one is 201", async () => {
+      const update = await call("/upsert_status", {
+        method: "POST",
+        body: JSON.stringify([{ name: "existing", rank: 2 }]),
+        headers: { prefer: "return=representation, resolution=merge-duplicates" },
+      });
+      expect(update.status).toBe(200);
+      expect(await json(update)).toEqual([{ name: "existing", rank: 2 }]);
+      expect(update.headers.get("preference-applied")).toBe(
+        "resolution=merge-duplicates, return=representation",
+      );
+
+      const mixed = await call("/upsert_status", {
+        method: "POST",
+        body: JSON.stringify([
+          { name: "existing", rank: 3 },
+          { name: "brand-new", rank: 1 },
+        ]),
+        headers: { prefer: "resolution=merge-duplicates" },
+      });
+      expect(mixed.status).toBe(201);
+    });
+
+    test("an all-update merge-duplicates with minimal is 200", async () => {
+      const res = await call("/upsert_status", {
+        method: "POST",
+        body: JSON.stringify([{ name: "existing", rank: 4 }]),
+        headers: { prefer: "resolution=merge-duplicates" },
+      });
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe("");
+    });
+
+    test("an all-update merge-duplicates with headers-only is 200 and keeps Location", async () => {
+      const res = await call("/upsert_status", {
+        method: "POST",
+        body: JSON.stringify([{ name: "existing", rank: 5 }]),
+        headers: { prefer: "return=headers-only, resolution=merge-duplicates" },
+      });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("location")).toBe("/rest/upsert_status?name=eq.existing");
+    });
+
+    test("PATCH applies the first array element but coerces every element", async () => {
+      const ok = await call("/items?id=eq.1", {
+        method: "PATCH",
+        body: JSON.stringify([{ name: "arr-a" }, { name: "arr-b" }]),
+        headers: { prefer: "return=representation" },
+      });
+      expect(ok.status).toBe(200);
+      expect(await json(ok)).toEqual([{ id: 1, name: "arr-a" }]);
+
+      const bad = await call("/compound?a=eq.1&b=eq.1", {
+        method: "PATCH",
+        body: JSON.stringify([
+          { a: 1, b: 1, value: "ok" },
+          { a: "bad", b: 2, value: "x" },
+        ]),
+        headers: { prefer: "return=representation" },
+      });
+      expect(bad.status).toBe(400);
+      expect((await json(bad)).code).toBe("22P02");
+    });
+
+    test("PUT applies the array element matching the URL primary key", async () => {
+      const res = await call("/tiobe?name=eq.Java", {
+        method: "PUT",
+        body: JSON.stringify([
+          { name: "Swift", rank: 1 },
+          { name: "Java", rank: 19 },
+        ]),
+        headers: { prefer: "return=representation" },
+      });
+      expect(res.status).toBe(200);
+      expect(await json(res)).toEqual([{ name: "Java", rank: 19 }]);
+    });
+
+    test("PUT rejects two array elements matching the same URL key", async () => {
+      const res = await call("/tiobe?name=eq.Java", {
+        method: "PUT",
+        body: JSON.stringify([
+          { name: "Java", rank: 5 },
+          { name: "Java", rank: 6 },
+        ]),
+        headers: { prefer: "return=representation" },
+      });
+      expect(res.status).toBe(500);
+      expect((await json(res)).code).toBe("21000");
+    });
+
+    test("bulk RPC checks max-affected against the total rows", async () => {
+      const over = await call("/rpc/many_items", {
+        method: "POST",
+        body: JSON.stringify([{ n: 2 }, { n: 3 }]),
+        headers: { prefer: "params=bulk, handling=strict, max-affected=2" },
+      });
+      expect(over.status).toBe(400);
+      expect((await json(over)).details).toBe("The query affects 5 rows");
+
+      const ok = await call("/rpc/many_items", {
+        method: "POST",
+        body: JSON.stringify([{ n: 2 }, { n: 3 }]),
+        headers: { prefer: "params=bulk, handling=strict, max-affected=5" },
+      });
+      expect(ok.status).toBe(200);
+    });
+  });
+
+  // -- Transaction and timezone preferences ---------------------------------
+
+  describe("transaction and timezone preferences", () => {
+    test("tx=rollback rolls the write back but returns the response", async () => {
+      const tx = createPgbase({ ...baseConfig, transactionEnd: "commit-allow-override" } as any);
+      const res = await callWith(tx, "/items", {
+        method: "POST",
+        body: JSON.stringify({ name: "tx-rb" }),
+        headers: { prefer: "return=representation, tx=rollback" },
+      });
+      expect(res.status).toBe(201);
+      expect(res.headers.get("preference-applied")).toBe("return=representation, tx=rollback");
+      expect(await json(res)).toHaveLength(1);
+
+      const check = await call("/items?select=id&name=eq.tx-rb");
+      expect(await json(check)).toEqual([]);
+    });
+
+    test("tx=commit persists when overrides are allowed", async () => {
+      const tx = createPgbase({ ...baseConfig, transactionEnd: "commit-allow-override" } as any);
+      const res = await callWith(tx, "/items", {
+        method: "POST",
+        body: JSON.stringify({ name: "tx-c" }),
+        headers: { prefer: "tx=commit" },
+      });
+      expect(res.status).toBe(201);
+
+      const check = await call("/items?select=id&name=eq.tx-c");
+      expect(await json(check)).toHaveLength(1);
+    });
+
+    test("tx is ignored when the config does not allow overrides", async () => {
+      const res = await call("/items", {
+        method: "POST",
+        body: JSON.stringify({ name: "tx-default" }),
+        headers: { prefer: "tx=rollback" },
+      });
+      expect(res.status).toBe(201);
+      expect(res.headers.get("preference-applied")).toBeNull();
+
+      const check = await call("/items?select=id&name=eq.tx-default");
+      expect(await json(check)).toHaveLength(1);
+    });
+
+    test("rollback-allow-override rolls back unless tx=commit", async () => {
+      const tx = createPgbase({ ...baseConfig, transactionEnd: "rollback-allow-override" } as any);
+      const rolledBack = await callWith(tx, "/items", {
+        method: "POST",
+        body: JSON.stringify({ name: "ra-rb" }),
+        headers: { prefer: "return=representation" },
+      });
+      expect(rolledBack.status).toBe(201);
+      expect(await json(await call("/items?select=id&name=eq.ra-rb"))).toEqual([]);
+
+      const committed = await callWith(tx, "/items", {
+        method: "POST",
+        body: JSON.stringify({ name: "ra-c" }),
+        headers: { prefer: "tx=commit" },
+      });
+      expect(committed.status).toBe(201);
+      expect(await json(await call("/items?select=id&name=eq.ra-c"))).toHaveLength(1);
+    });
+
+    test("an invalid transactionEnd is rejected at startup", () => {
+      expect(() => createPgbase({ ...baseConfig, transactionEnd: "sometimes" } as any)).toThrow(
+        /transactionEnd/,
+      );
+    });
+
+    test("timezone applies for the transaction and is echoed", async () => {
+      const res = await call("/rpc/tz_probe", {
+        method: "POST",
+        body: "{}",
+        headers: { prefer: "timezone=America/Los_Angeles" },
+      });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("preference-applied")).toBe("timezone=America/Los_Angeles");
+      expect(await json(res)).toEqual(["America/Los_Angeles"]);
+    });
+
+    test("an invalid timezone is a 400", async () => {
+      const res = await call("/rpc/tz_probe", {
+        method: "POST",
+        body: "{}",
+        headers: { prefer: "timezone=Not/AZone" },
+      });
+      expect(res.status).toBe(400);
+      expect((await json(res)).code).toBe("22023");
     });
   });
 

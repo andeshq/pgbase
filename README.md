@@ -91,6 +91,7 @@ Run it with `bun run app.ts` (or `bunx wrangler`/`node` with a Hono adapter).
 | `defaultLimit` | `number` | — | Limit used when the request omits one. |
 | `exposed` | `{ tables?: string[]; views?: string[] } \| false` | all | Allow-list of reachable relations. |
 | `allowUnfilteredViewWrites` | `boolean` | `false` | Permit unfiltered `PATCH`/`DELETE` on updatable views. |
+| `transactionEnd` | `"commit" \| "rollback" \| "commit-allow-override" \| "rollback-allow-override"` | `"commit"` | How transactions end, mirroring `db-tx-end`. Only the `*-allow-override` modes honor `Prefer: tx=...`. |
 | `anonRole` | `string` | — | Role used when `getSession` returns `null`. Mirrors `db-anon-role`. |
 | `allowConnectionRole` | `boolean` | `false` | Acknowledge that role-less requests run as the connection role (silences the startup warning). |
 | `maxBodyBytes` | `number` | `1048576` | Reject request bodies larger than this with `413`. |
@@ -385,6 +386,8 @@ Prefer: resolution=ignore-duplicates     # POST skip conflicts
 Prefer: missing=default                  # omitted columns use DEFAULT, not NULL
 Prefer: handling=strict                  # unknown columns and preferences are an error
 Prefer: max-affected=10                  # PATCH/DELETE/RPC: fail past 10 rows when strict
+Prefer: tx=rollback                      # roll back after the response is built (see transactionEnd)
+Prefer: timezone=UTC                     # set the transaction timezone
 
 POST /rest/books?columns=title,author_id   # vertical filtering (validated against the schema)
 ```
@@ -429,15 +432,16 @@ Nested writes reject `columns`, conflict resolution, and `missing=default`, and
 `on_conflict` is only allowed for nested `PUT`. Everything runs in the request
 transaction, so a failure at any depth rolls back the whole request.
 
-- `POST` replies `201 Created` (or `200` when `resolution=merge-duplicates` inserted nothing). `Location` is only sent with `Prefer: return=headers-only`.
-- `PUT` replies `201` when it inserted and `200` when it updated with `return=representation`; otherwise `204`.
-- `PATCH`/`DELETE` reply `200` with `return=representation`, otherwise `204`.
+- `POST` replies `201 Created` (or `200` when `resolution=merge-duplicates` inserted no rows, i.e. every payload row was an update). `Location` is only sent with `Prefer: return=headers-only`.
+- `PUT` replies `201` when it inserted and `200` when it updated with `return=representation`; otherwise `204`. An array payload applies the element whose primary key matches the URL.
+- `PATCH`/`DELETE` reply `200` with `return=representation`, otherwise `204`. An array payload applies its first element but every element must still coerce to its column types.
 - `Content-Range` follows PostgREST: `*/*` for POST/DELETE, `0-N/*` for PATCH, and none for PUT; the total is the affected count when `Prefer: count` is requested.
 - `PUT` requires the query filters to be **exactly the primary-key columns with `eq`** (`405 PGRST105` otherwise), rejects `limit`/`offset` (`400 PGRST114`), and rejects a payload whose primary key disagrees with the URL (`400 PGRST115`).
 - `POST []` inserts nothing but is still `201` (`200` for `merge-duplicates`); bulk arrays must have uniform keys unless `?columns=` is given.
 - A singular `Accept` on a write enforces exactly one affected row and rolls the write back with `406 PGRST116` otherwise, whatever the return preference.
 - `Preference-Applied` only echoes preferences that were explicitly requested, and only when they applied (for example, `resolution` is dropped on a table without a conflict target).
-- `max-affected` is enforced for `PATCH`/`DELETE`/RPC when `handling=strict`; RPC additionally requires a `SETOF`/`TABLE` return (`400 PGRST128`).
+- `max-affected` is enforced for `PATCH`/`DELETE`/RPC when `handling=strict`; RPC additionally requires a `SETOF`/`TABLE` return (`400 PGRST128`). Bulk RPC calls check the total returned rows.
+- `Prefer: tx=rollback` rolls the transaction back after the response is built; it is only parsed in the `*-allow-override` `transactionEnd` modes, matching PostgREST's `db-tx-end`. `Prefer: timezone=<tz>` sets the transaction timezone (an invalid zone is a `400 22023`). Both are echoed in `Preference-Applied` when parsed.
 - Unfiltered `PATCH`/`DELETE` are rejected by default for tables and views;
   explicitly set `allowUnfilteredViewWrites: true` only when a view is safe to sweep.
 - `Prefer: return=representation` re-reads embedded/many-to-many results, or uses a

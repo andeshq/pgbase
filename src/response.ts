@@ -93,11 +93,14 @@ function readStatus(request: ParsedRequest, rows: any[], count: number | null): 
 
 /** `Preference-Applied` for reads/RPC: only explicitly requested preferences. */
 function readAppliedPreferences(request: ParsedRequest, includeMaxAffected = false): string {
+  const { count, transaction, handling, timezone, maxAffected } = request.prefer;
   const parts: string[] = [];
-  if (request.count) parts.push(`count=${request.count}`);
-  if (request.prefer.handling) parts.push(`handling=${request.prefer.handling}`);
-  if (includeMaxAffected && request.prefer.handling === "strict" && request.prefer.maxAffected !== null) {
-    parts.push(`max-affected=${request.prefer.maxAffected}`);
+  if (count) parts.push(`count=${count}`);
+  if (transaction) parts.push(`tx=${transaction}`);
+  if (handling) parts.push(`handling=${handling}`);
+  if (timezone) parts.push(`timezone=${timezone}`);
+  if (includeMaxAffected && handling === "strict" && maxAffected !== null) {
+    parts.push(`max-affected=${maxAffected}`);
   }
   return parts.join(", ");
 }
@@ -149,7 +152,8 @@ export function buildResponse(
  * POST/PATCH, max-affected only for PATCH/DELETE under handling=strict).
  */
 function appliedPreferences(request: ParsedMutation, result: MutationResult): string {
-  const { return: ret, count, resolution, missing, handling, maxAffected } = request.prefer;
+  const { return: ret, count, resolution, missing, handling, timezone, transaction, maxAffected } =
+    request.prefer;
   const parts: string[] = [];
   if (request.method === "POST" && resolution && result.resolutionApplied) {
     parts.push(`resolution=${resolution}`);
@@ -159,7 +163,9 @@ function appliedPreferences(request: ParsedMutation, result: MutationResult): st
   }
   if (ret) parts.push(`return=${ret}`);
   if (count) parts.push(`count=${count}`);
+  if (transaction) parts.push(`tx=${transaction}`);
   if (handling) parts.push(`handling=${handling}`);
+  if (timezone) parts.push(`timezone=${timezone}`);
   if (
     handling === "strict" &&
     maxAffected !== null &&
@@ -192,7 +198,14 @@ function writeStatus(
     return 401;
   }
   if (request.method === "POST") {
-    if (request.prefer.resolution === "merge-duplicates" && (count ?? 0) === 0) return 200;
+    // Merge-duplicates replies 200 when nothing was actually inserted: either
+    // the counter says so, or the payload was an empty array.
+    if (
+      request.prefer.resolution === "merge-duplicates" &&
+      (inserted === false || (count ?? 0) === 0)
+    ) {
+      return 200;
+    }
     return 201;
   }
   if (request.prefer.return === "representation") {

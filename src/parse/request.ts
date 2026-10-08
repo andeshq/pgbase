@@ -165,7 +165,7 @@ const ACCEPTED_PREFS = new Set([
  * Mirrors PostgREST: the first occurrence of a preference wins, unknown tokens
  * are recorded, and `handling=strict` turns them into a 400 PGRST122.
  */
-export function parsePrefer(header: string | null): PreferOptions {
+export function parsePrefer(header: string | null, allowTxOverride = false): PreferOptions {
   const prefer: PreferOptions = {
     return: null,
     count: parsePreferCount(header),
@@ -173,6 +173,8 @@ export function parsePrefer(header: string | null): PreferOptions {
     missing: null,
     handling: null,
     params: "single-object",
+    transaction: null,
+    timezone: null,
     maxAffected: null,
     invalid: [],
   };
@@ -202,6 +204,10 @@ export function parsePrefer(header: string | null): PreferOptions {
       prefer.handling = token.slice(9) as PreferOptions["handling"];
     } else if (token === "params=single-object" || token === "params=bulk") {
       prefer.params = token.slice(7) as PreferOptions["params"];
+    } else if (allowTxOverride && (token === "tx=commit" || token === "tx=rollback")) {
+      prefer.transaction = token.slice(3) as PreferOptions["transaction"];
+    } else if (token.startsWith("timezone=")) {
+      prefer.timezone = token.slice(9) || null;
     } else if (token.startsWith("max-affected=")) {
       const parsed = Number(token.slice(13));
       prefer.maxAffected = Number.isInteger(parsed) && parsed >= 0 ? parsed : null;
@@ -218,7 +224,12 @@ export function parsePrefer(header: string | null): PreferOptions {
  * Translate an HTTP request into the read AST. Structural only: column
  * existence is validated later while compiling, once the schema is known.
  */
-export function parseRequest(request: Request, schemaName: string, table: string): ParsedRequest {
+export function parseRequest(
+  request: Request,
+  schemaName: string,
+  table: string,
+  allowTxOverride = false,
+): ParsedRequest {
   const url = new URL(request.url);
   const params = url.searchParams;
 
@@ -308,7 +319,7 @@ export function parseRequest(request: Request, schemaName: string, table: string
   const accept = request.headers.get("accept") ?? "";
   const singular = accept.includes("application/vnd.pgrst.object+json");
   const format: ParsedRequest["format"] = accept.includes("text/csv") ? "csv" : "json";
-  const prefer = parsePrefer(request.headers.get("prefer"));
+  const prefer = parsePrefer(request.headers.get("prefer"), allowTxOverride);
   const profile = profileFor(request);
 
   return {
@@ -348,8 +359,9 @@ export function parseMutation(
   schemaName: string,
   table: string,
   method: WriteMethod,
+  allowTxOverride = false,
 ): ParsedMutation {
-  const base = parseRequest(request, schemaName, table);
+  const base = parseRequest(request, schemaName, table, allowTxOverride);
   const params = new URL(request.url).searchParams;
 
   let columns: string[] | null = null;
@@ -421,7 +433,12 @@ export function splitRpcParams(
  * `nameArg` is the decoded path segment after `rpc/`; extra segments select an
  * overload, e.g. `/rpc/add/2/1`.
  */
-export function parseRpc(request: Request, schemaName: string, nameArg: string): ParsedRpc {
+export function parseRpc(
+  request: Request,
+  schemaName: string,
+  nameArg: string,
+  allowTxOverride = false,
+): ParsedRpc {
   const segments = nameArg.split("/").map((segment) => decodeURIComponent(segment));
   const fn = segments[0] ?? "";
   const pathArgs = segments.slice(1);
@@ -429,7 +446,7 @@ export function parseRpc(request: Request, schemaName: string, nameArg: string):
   const url = new URL(request.url);
   const params = url.searchParams;
   const select = parseSelect(params.get("select") ?? "*");
-  const prefer = parsePrefer(request.headers.get("prefer"));
+  const prefer = parsePrefer(request.headers.get("prefer"), allowTxOverride);
   const order = params.get("order") ? parseOrderTerms(params.get("order")!) : [];
   const limit = parseLimit(params.get("limit"), true);
   const offset = parseOffset(params.get("offset"));

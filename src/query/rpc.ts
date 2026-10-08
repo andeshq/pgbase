@@ -6,6 +6,7 @@ import type { PgbaseFunction, PgbaseRelation } from "../types.ts";
 import { buildSelectionList, type ExecContext } from "./compile.ts";
 import { renderFilter, type QueryLevel } from "./filters.ts";
 import { RPC_ALIAS } from "./aliases.ts";
+import { assertMaxAffected } from "./write.ts";
 
 export interface RpcContext extends ExecContext {
   rpc: ParsedRpc;
@@ -90,7 +91,9 @@ export async function executeRpc(ctx: RpcContext, method: string, body: unknown)
   // Scalar / record-returning functions: PostgREST returns the bare JSON value.
   if (!fn.returnsSet && !fn.returnsTable) {
     const result = await sql<{ value: unknown }>`select ${fnCall} as value`.execute(ctx.db);
-    return { rows: [result.rows[0]?.value ?? null], count: null, affected: 1 };
+    const rows = [result.rows[0]?.value ?? null];
+    assertRpcResult(ctx, rows);
+    return { rows, count: null, affected: 1 };
   }
 
   // Set-returning: treat the function as a derived table so select/filter/
@@ -123,7 +126,19 @@ export async function executeRpc(ctx: RpcContext, method: string, body: unknown)
     const row = await countQb.executeTakeFirst();
     count = row ? Number((row as any).count) : 0;
   }
+  assertRpcResult(ctx, rows);
   return { rows, count, affected: rows.length };
+}
+
+/**
+ * Singular coercion and `max-affected` are enforced inside the transaction so a
+ * violation rolls back any writes the function performed. Bulk invocations are
+ * checked once by the caller instead.
+ */
+function assertRpcResult(ctx: RpcContext, rows: any[]): void {
+  if (ctx.rpc.bulkArgs) return;
+  if (ctx.rpc.singular && rows.length !== 1) throw PgbaseError.notSingular(rows.length);
+  assertMaxAffected(ctx.rpc.prefer, rows.length);
 }
 
 /**

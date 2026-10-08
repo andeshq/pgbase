@@ -6,7 +6,7 @@ import type { PgbaseContext } from "./types.ts";
 
 export type ErrorVerbosity = "verbose" | "minimal";
 
-const VARY = "Accept, Prefer, Range, Accept-Profile";
+export const VARY = "Accept, Prefer, Range";
 
 type BodyFormat = "json" | "csv" | "singular";
 
@@ -80,18 +80,58 @@ function contentRange(request: ParsedRequest, rows: any[], count: number | null)
   return `${start}-${start + rows.length - 1}/${total}`;
 }
 
-export function buildResponse(request: ParsedRequest, result: ReadResult, method: string): Response {
+/**
+ * PostgREST's read status: `200` unless a count was requested, in which case a
+ * partial window is `206` and an offset past the last row is `416`.
+ */
+function readStatus(request: ParsedRequest, rows: any[], count: number | null): number {
+  if (count === null) return 200;
+  const start = request.offset ?? 0;
+  if (start > count) return 416;
+  return rows.length < count ? 206 : 200;
+}
+
+/** `Preference-Applied` for reads/RPC: only explicitly requested preferences. */
+function readAppliedPreferences(request: ParsedRequest, includeMaxAffected = false): string {
+  const parts: string[] = [];
+  if (request.count) parts.push(`count=${request.count}`);
+  if (request.prefer.handling) parts.push(`handling=${request.prefer.handling}`);
+  if (includeMaxAffected && request.prefer.handling === "strict" && request.prefer.maxAffected !== null) {
+    parts.push(`max-affected=${request.prefer.maxAffected}`);
+  }
+  return parts.join(", ");
+}
+
+export function buildResponse(
+  request: ParsedRequest,
+  result: ReadResult,
+  method: string,
+  basePath = "",
+): Response {
   const { rows, count } = result;
-  if (request.singular && rows.length !== 1) throw PgbaseError.notSingular(rows.length);
 
   const headers = new Headers();
   headers.set("Content-Range", contentRange(request, rows, count));
-  if (request.count) headers.set("Preference-Applied", `count=${request.count}`);
+  headers.set(
+    "Content-Location",
+    `${basePath}/${request.table}${request.canonicalQuery ? `?${request.canonicalQuery}` : ""}`,
+  );
+  const applied = readAppliedPreferences(request);
+  if (applied) headers.set("Preference-Applied", applied);
   if (request.profile) headers.set("Content-Profile", request.profile);
+
+  if (request.singular && rows.length !== 1) throw PgbaseError.notSingular(rows.length);
+
+  const status = readStatus(request, rows, count);
+  if (status === 416) {
+    const error = PgbaseError.rangeOutOfBounds(request.offset ?? 0, count ?? 0);
+    headers.set("Content-Type", "application/json; charset=utf-8");
+    return new Response(JSON.stringify(error.toJSON()), { status, headers });
+  }
 
   return send({
     rows,
-    status: request.ranged ? 206 : 200,
+    status,
     headers,
     format: request.singular ? "singular" : request.format,
     body: method !== "HEAD",
@@ -102,14 +142,31 @@ export function buildResponse(request: ParsedRequest, result: ReadResult, method
 // Writes
 // ---------------------------------------------------------------------------
 
-function appliedPreferences(request: ParsedMutation): string {
-  const { return: ret, count, resolution, missing, handling } = request.prefer;
+/**
+ * Build `Preference-Applied` for writes, mirroring PostgREST: only preferences
+ * explicitly requested are echoed, in a fixed order, and some are scoped to the
+ * method (resolution only for POST with a conflict target, missing only for
+ * POST/PATCH, max-affected only for PATCH/DELETE under handling=strict).
+ */
+function appliedPreferences(request: ParsedMutation, result: MutationResult): string {
+  const { return: ret, count, resolution, missing, handling, maxAffected } = request.prefer;
   const parts: string[] = [];
+  if (request.method === "POST" && resolution && result.resolutionApplied) {
+    parts.push(`resolution=${resolution}`);
+  }
+  if ((request.method === "POST" || request.method === "PATCH") && missing) {
+    parts.push(`missing=${missing}`);
+  }
   if (ret) parts.push(`return=${ret}`);
   if (count) parts.push(`count=${count}`);
-  if (resolution) parts.push(`resolution=${resolution}`);
-  if (missing) parts.push(`missing=${missing}`);
   if (handling) parts.push(`handling=${handling}`);
+  if (
+    handling === "strict" &&
+    maxAffected !== null &&
+    (request.method === "PATCH" || request.method === "DELETE")
+  ) {
+    parts.push(`max-affected=${maxAffected}`);
+  }
   return parts.join(", ");
 }
 
@@ -164,12 +221,9 @@ export function buildWriteResponse(
   basePath = "",
 ): Response {
   const { rows, count } = result;
-  const represent = request.prefer.return === "representation";
-
-  if (request.singular && represent && rows.length !== 1) throw PgbaseError.notSingular(rows.length);
 
   const headers = new Headers();
-  const applied = appliedPreferences(request);
+  const applied = appliedPreferences(request, result);
   if (applied) headers.set("Preference-Applied", applied);
   const range = writeContentRange(request, count);
   if (range !== null) headers.set("Content-Range", range);
@@ -185,7 +239,7 @@ export function buildWriteResponse(
   }
 
   const status = writeStatus(request, ctx, count, result.inserted);
-  if (!represent) return new Response(null, { status, headers });
+  if (request.prefer.return !== "representation") return new Response(null, { status, headers });
 
   return send({
     rows,
@@ -207,14 +261,20 @@ export function buildRpcResponse(
 ): Response {
   const headers = new Headers();
   if (request.profile) headers.set("Content-Profile", request.profile);
-  if (request.count) {
-    headers.set("Preference-Applied", `count=${request.count}`);
-    headers.set("Content-Range", `*/${result.count ?? result.rows.length}`);
+  headers.set("Content-Range", contentRange(request, result.rows, result.count));
+  const applied = readAppliedPreferences(request, true);
+  if (applied) headers.set("Preference-Applied", applied);
+
+  const status = readStatus(request, result.rows, result.count);
+  if (status === 416) {
+    const error = PgbaseError.rangeOutOfBounds(request.offset ?? 0, result.count ?? 0);
+    headers.set("Content-Type", "application/json; charset=utf-8");
+    return new Response(JSON.stringify(error.toJSON()), { status, headers });
   }
 
   return send({
     rows: result.rows,
-    status: 200,
+    status,
     headers,
     format: request.singular ? "singular" : request.format,
     body: method !== "HEAD",

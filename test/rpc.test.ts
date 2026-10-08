@@ -225,12 +225,22 @@ suite("RPC against Postgres", () => {
   });
 
   test("singular accept returns the bare object/value", async () => {
-    const res = await call("/rpc/book_stats", {
+    const res = await call("/rpc/book_stats?published=eq.false", {
       method: "POST",
       body: "{}",
       headers: { accept: "application/vnd.pgrst.object+json" },
     });
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ published: false, total: "1" });
+  });
+
+  test("singular accept with multiple rows is 406", async () => {
+    const res = await call("/rpc/book_stats", {
+      method: "POST",
+      body: "{}",
+      headers: { accept: "application/vnd.pgrst.object+json" },
+    });
+    expect(res.status).toBe(406);
+    expect(((await res.json()) as any).code).toBe("PGRST116");
   });
 });

@@ -63,29 +63,52 @@ function routeEmbedKey(key: string, paths: Set<string>): { path: string; rest: s
   return null;
 }
 
-function parseSize(value: string, name: string): number {
-  if (!/^\d+$/.test(value.trim())) throw PgbaseError.parse(`invalid ${name}: ${value}`);
-  return Number(value);
+/**
+ * `limit` accepts only non-negative integers; anything else is ignored, except
+ * a negative limit which is an unsatisfiable range (PostgREST PGRST103).
+ */
+function parseLimit(value: string | null, topLevel: boolean): number | undefined {
+  if (value == null || value === "") return undefined;
+  if (!/^-?\d+$/.test(value.trim())) return undefined;
+  const parsed = Number(value);
+  if (parsed < 0) {
+    if (topLevel) throw PgbaseError.invalidRange("Limit should be greater than or equal to zero.");
+    // Embedded ranges have no top-level validity check: a negative limit is an
+    // empty range, so nothing is returned.
+    return 0;
+  }
+  return parsed;
 }
 
-function parseOptionalSize(value: string | null, name: string): number | undefined {
+/** A negative or non-numeric offset is a no-op, mirroring PostgREST. */
+function parseOffset(value: string | null): number | undefined {
   if (value == null || value === "") return undefined;
-  return parseSize(value, name);
+  if (!/^-?\d+$/.test(value.trim())) return undefined;
+  const parsed = Number(value);
+  return parsed > 0 ? parsed : undefined;
 }
 
 interface RangeHeader {
   offset: number;
-  limit: number | null;
+  end: number | null;
 }
 
+/**
+ * Parse a `Range` header. Malformed headers are ignored (PostgREST treats them
+ * as `allRange`), but a lower bound above the upper bound is PGRST103.
+ */
 function parseRangeHeader(header: string | null): RangeHeader | null {
   if (!header) return null;
   const match = /^(\d+)-(\d*)$/.exec(header.trim());
-  if (!match) throw PgbaseError.invalidRange(`invalid range: ${header}`);
+  if (!match) return null;
   const offset = Number(match[1]);
   const end = match[2] ? Number(match[2]) : null;
-  if (end !== null && end < offset) throw PgbaseError.invalidRange(`invalid range: ${header}`);
-  return { offset, limit: end !== null ? end - offset + 1 : null };
+  if (end !== null && end < offset) {
+    throw PgbaseError.invalidRange(
+      "The lower boundary must be lower than or equal to the upper boundary in the Range header.",
+    );
+  }
+  return { offset, end };
 }
 
 function parsePreferCount(header: string | null): ParsedRequest["count"] {
@@ -99,30 +122,94 @@ function parsePreferCount(header: string | null): ParsedRequest["count"] {
   return null;
 }
 
-/** Parse every `Prefer` token we understand, e.g. `return=representation`. */
+const WRITE_METHODS = new Set(["POST", "PATCH", "PUT", "DELETE"]);
+
+/** Writes negotiate the schema with `Content-Profile`, reads with `Accept-Profile`. */
+function profileFor(request: Request): string | undefined {
+  const header = WRITE_METHODS.has(request.method.toUpperCase()) ? "content-profile" : "accept-profile";
+  return request.headers.get(header) ?? undefined;
+}
+
+/** PostgREST's canonical location: params sorted by key and re-encoded. */
+function canonicalQueryString(url: URL): string {
+  const pairs: Array<[string, string]> = [];
+  for (const [key, value] of url.searchParams.entries()) pairs.push([key, value]);
+  pairs.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  const encode = (value: string) => encodeURIComponent(value).replace(/%20/g, "+");
+  return pairs.map(([key, value]) => `${encode(key)}=${encode(value)}`).join("&");
+}
+
+/** Preferences PostgREST recognizes. Anything else is collected as invalid. */
+const ACCEPTED_PREFS = new Set([
+  "resolution=merge-duplicates",
+  "resolution=ignore-duplicates",
+  "return=minimal",
+  "return=representation",
+  "return=headers-only",
+  "count=exact",
+  "count=planned",
+  "count=estimated",
+  "tx=commit",
+  "tx=rollback",
+  "missing=default",
+  "missing=null",
+  "handling=strict",
+  "handling=lenient",
+  "params=single-object",
+  "params=bulk",
+]);
+
+/**
+ * Parse every `Prefer` token we understand, e.g. `return=representation`.
+ *
+ * Mirrors PostgREST: the first occurrence of a preference wins, unknown tokens
+ * are recorded, and `handling=strict` turns them into a 400 PGRST122.
+ */
 export function parsePrefer(header: string | null): PreferOptions {
   const prefer: PreferOptions = {
-    return: "minimal",
+    return: null,
     count: parsePreferCount(header),
     resolution: null,
     missing: null,
     handling: null,
     params: "single-object",
+    maxAffected: null,
+    invalid: [],
   };
   if (!header) return prefer;
-  for (const token of header.split(",")) {
-    const [key, rawValue] = token.split("=").map((s) => s.trim());
-    if (key === "return" && (rawValue === "minimal" || rawValue === "representation" || rawValue === "headers-only")) {
-      prefer.return = rawValue;
-    } else if (key === "resolution" && (rawValue === "merge-duplicates" || rawValue === "ignore-duplicates")) {
-      prefer.resolution = rawValue;
-    } else if (key === "missing" && rawValue === "default") {
-      prefer.missing = "default";
-    } else if (key === "handling" && (rawValue === "strict" || rawValue === "lenient")) {
-      prefer.handling = rawValue;
-    } else if (key === "params" && (rawValue === "single-object" || rawValue === "bulk")) {
-      prefer.params = rawValue;
+
+  const seen = new Set<string>();
+  for (const raw of header.split(",")) {
+    const token = raw.trim();
+    if (token === "") continue;
+    if (!ACCEPTED_PREFS.has(token) && !token.startsWith("timezone=") && !token.startsWith("max-affected=")) {
+      prefer.invalid.push(token);
+      continue;
     }
+    const key = token.slice(0, token.indexOf("="));
+    if (seen.has(key)) continue; // only the first occurrence is used
+    seen.add(key);
+
+    if (token === "return=minimal" || token === "return=representation" || token === "return=headers-only") {
+      prefer.return = token.slice(7) as PreferOptions["return"];
+    } else if (token === "resolution=merge-duplicates" || token === "resolution=ignore-duplicates") {
+      prefer.resolution = token.slice(11) as PreferOptions["resolution"];
+    } else if (token === "missing=default") {
+      prefer.missing = "default";
+    } else if (token === "missing=null") {
+      prefer.missing = "null";
+    } else if (token === "handling=strict" || token === "handling=lenient") {
+      prefer.handling = token.slice(9) as PreferOptions["handling"];
+    } else if (token === "params=single-object" || token === "params=bulk") {
+      prefer.params = token.slice(7) as PreferOptions["params"];
+    } else if (token.startsWith("max-affected=")) {
+      const parsed = Number(token.slice(13));
+      prefer.maxAffected = Number.isInteger(parsed) && parsed >= 0 ? parsed : null;
+    }
+  }
+
+  if (prefer.handling === "strict" && prefer.invalid.length > 0) {
+    throw PgbaseError.invalidPreferences(prefer.invalid);
   }
   return prefer;
 }
@@ -172,8 +259,8 @@ export function parseRequest(request: Request, schemaName: string, table: string
     const route = routeEmbedKey(key, embedPaths);
     if (route && (route.rest === "limit" || route.rest === "offset" || route.rest === "order")) {
       const embed = getEmbed(route.path);
-      if (route.rest === "limit") embed.limit = parseSize(value, key);
-      else if (route.rest === "offset") embed.offset = parseSize(value, key);
+      if (route.rest === "limit") embed.limit = parseLimit(value, false);
+      else if (route.rest === "offset") embed.offset = parseOffset(value);
       else embed.order = parseOrderTerms(value);
       continue;
     }
@@ -185,21 +272,44 @@ export function parseRequest(request: Request, schemaName: string, table: string
     }
   }
 
-  let limit = parseOptionalSize(params.get("limit"), "limit");
-  let offset = parseOptionalSize(params.get("offset"), "offset");
+  let start = parseOffset(params.get("offset")) ?? 0;
+  let end: number | null = null;
+  const limitParam = parseLimit(params.get("limit"), true);
+  if (limitParam !== undefined) end = start + limitParam - 1;
 
-  const ranged = request.headers.has("range");
-  const range = parseRangeHeader(request.headers.get("range"));
+  // The Range header is only honored for reads, and intersects with the
+  // limit/offset query parameters.
+  const method = request.method.toUpperCase();
+  const range =
+    method === "GET" || method === "HEAD" ? parseRangeHeader(request.headers.get("range")) : null;
   if (range) {
-    if (offset === undefined) offset = range.offset;
-    if (limit === undefined && range.limit !== null) limit = range.limit;
+    start = Math.max(start, range.offset);
+    if (range.end !== null) end = end === null ? range.end : Math.min(end, range.end);
+    if (end !== null && end < start) {
+      if (limitParam === 0) {
+        // `limit=0` is the one allowed empty range and short-circuits.
+        start = 0;
+        end = -1;
+      } else {
+        throw PgbaseError.invalidRange(
+          "The lower boundary must be lower than or equal to the upper boundary in the Range header.",
+        );
+      }
+    }
   }
+  if (limitParam === 0) {
+    start = 0;
+    end = -1;
+  }
+
+  const limit = end === null ? undefined : end - start + 1;
+  const offset = start > 0 ? start : undefined;
 
   const accept = request.headers.get("accept") ?? "";
   const singular = accept.includes("application/vnd.pgrst.object+json");
   const format: ParsedRequest["format"] = accept.includes("text/csv") ? "csv" : "json";
   const prefer = parsePrefer(request.headers.get("prefer"));
-  const profile = request.headers.get("accept-profile") ?? undefined;
+  const profile = profileFor(request);
 
   return {
     table,
@@ -214,7 +324,8 @@ export function parseRequest(request: Request, schemaName: string, table: string
     count: prefer.count,
     format,
     profile,
-    ranged,
+    canonicalQuery: canonicalQueryString(url),
+    ranged: range !== null,
     prefer,
   };
 }
@@ -248,6 +359,7 @@ export function parseMutation(
       .split(",")
       .map((s) => unquote(s.trim()))
       .filter((s) => s.length > 0);
+    if (columns.length === 0) throw PgbaseError.parse("failed to parse columns parameter ()");
   }
 
   let onConflict: string[] | null = null;
@@ -257,9 +369,14 @@ export function parseMutation(
       .split(",")
       .map((s) => unquote(s.trim()))
       .filter((s) => s.length > 0);
+    if (onConflict.length === 0) throw PgbaseError.parse("failed to parse on_conflict parameter ()");
   }
 
-  return { ...base, method, columns, onConflict };
+  // PUT rejects `limit`/`offset`; the check uses the effective range, so a
+  // negative (no-op) offset or an ignored non-numeric value is not a range.
+  const rangeLimited = base.limit !== undefined || base.offset !== undefined;
+
+  return { ...base, method, columns, onConflict, rangeLimited };
 }
 
 /**
@@ -314,8 +431,8 @@ export function parseRpc(request: Request, schemaName: string, nameArg: string):
   const select = parseSelect(params.get("select") ?? "*");
   const prefer = parsePrefer(request.headers.get("prefer"));
   const order = params.get("order") ? parseOrderTerms(params.get("order")!) : [];
-  const limit = parseOptionalSize(params.get("limit"), "limit");
-  const offset = parseOptionalSize(params.get("offset"), "offset");
+  const limit = parseLimit(params.get("limit"), true);
+  const offset = parseOffset(params.get("offset"));
 
   const queryArgs: Record<string, unknown> = {};
   for (const [key, value] of params.entries()) {
@@ -341,7 +458,8 @@ export function parseRpc(request: Request, schemaName: string, nameArg: string):
     singular,
     count: prefer.count,
     format,
-    profile: request.headers.get("accept-profile") ?? undefined,
+    profile: profileFor(request),
+    canonicalQuery: canonicalQueryString(url),
     ranged: false,
     prefer,
     params: prefer.params,

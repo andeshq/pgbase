@@ -24,7 +24,7 @@ const pgbase = createPgbase({
 - **Configurable** — pass a Kysely instance, an exposed schema, a session resolver, row caps, an allow-list, hooks.
 - **RLS-first** — every request runs in a transaction with `SET LOCAL ROLE`, a schema `search_path`, and the `request.jwt.claims`, `request.headers`, `request.cookies`, `request.method` and `request.path` GUCs.
 - **Reads** — `select` (aliases, casts, JSON paths), full operator set, `and`/`or`/`not`, `order`, `limit`/`offset`, `Range`, counts, singular objects, CSV.
-- **Writes** — `POST` (bulk), `PATCH`, `PUT` upsert, `DELETE`, with `Prefer: return=representation|minimal|headers-only`, `count`, `resolution`, `missing=default` and `handling=strict`.
+- **Writes** — `POST` (bulk), `PATCH`, `PUT` upsert, `DELETE`, with `Prefer: return=representation|minimal|headers-only`, `count`, `resolution`, `missing=default`, `max-affected` and `handling=strict`.
 - **Nested writes** — insert and update related to-one, to-many and many-to-many rows in the same request and transaction.
 - **RPC** — `POST /rpc/<fn>` for functions and procedures, named or positional args, scalar and `SETOF`/`TABLE` returns, result `select`/filter/`order`/`limit`, and `Prefer: params=bulk`.
 - **Embedding** — to-one, to-many and many-to-many, nested, with `!hint` and `!inner`, compiled into a single SQL query with `json_agg` / `to_json`.
@@ -377,12 +377,13 @@ Prefer: return=representation            # POST 201 / PATCH|PUT|DELETE 200 with 
 Prefer: return=minimal                   # POST 201 / PATCH|PUT|DELETE 204, no body (default)
 Prefer: return=headers-only              # same statuses, no body; only POST gets Location
 Prefer: count=exact                      # Content-Range total is the affected count
-Prefer: resolution=merge-duplicates      # POST upsert
+Prefer: resolution=merge-duplicates      # POST upsert (ignored without a PK or ?on_conflict=)
 Prefer: resolution=ignore-duplicates     # POST skip conflicts
 Prefer: missing=default                  # omitted columns use DEFAULT, not NULL
-Prefer: handling=strict                  # unknown columns are an error (default: drop)
+Prefer: handling=strict                  # unknown columns and preferences are an error
+Prefer: max-affected=10                  # PATCH/DELETE/RPC: fail past 10 rows when strict
 
-POST /rest/books?columns=title,author_id   # vertical filtering
+POST /rest/books?columns=title,author_id   # vertical filtering (validated against the schema)
 ```
 
 `POST` also accepts nested related objects/arrays. pgbase inserts the related
@@ -429,6 +430,11 @@ transaction, so a failure at any depth rolls back the whole request.
 - `PUT` replies `201` when it inserted and `200` when it updated with `return=representation`; otherwise `204`.
 - `PATCH`/`DELETE` reply `200` with `return=representation`, otherwise `204`.
 - `Content-Range` follows PostgREST: `*/*` for POST/DELETE, `0-N/*` for PATCH, and none for PUT; the total is the affected count when `Prefer: count` is requested.
+- `PUT` requires the query filters to be **exactly the primary-key columns with `eq`** (`405 PGRST105` otherwise), rejects `limit`/`offset` (`400 PGRST114`), and rejects a payload whose primary key disagrees with the URL (`400 PGRST115`).
+- `POST []` inserts nothing but is still `201` (`200` for `merge-duplicates`); bulk arrays must have uniform keys unless `?columns=` is given.
+- A singular `Accept` on a write enforces exactly one affected row and rolls the write back with `406 PGRST116` otherwise, whatever the return preference.
+- `Preference-Applied` only echoes preferences that were explicitly requested, and only when they applied (for example, `resolution` is dropped on a table without a conflict target).
+- `max-affected` is enforced for `PATCH`/`DELETE`/RPC when `handling=strict`; RPC additionally requires a `SETOF`/`TABLE` return (`400 PGRST128`).
 - Unfiltered `PATCH`/`DELETE` are rejected by default for tables and views;
   explicitly set `allowUnfilteredViewWrites: true` only when a view is safe to sweep.
 - `Prefer: return=representation` re-reads embedded/many-to-many results, or uses a
@@ -485,7 +491,7 @@ Accept: text/csv
 
 > Ordering a parent row by an embedded column (`order=books.title.asc`) is not supported yet; order embedded rows with `books.order=` instead.
 
-Responses always include a PostgREST-style `Content-Range`. A `Range` request returns `206 Partial Content`. Errors use the PostgREST envelope:
+Responses always include a PostgREST-style `Content-Range` and a `Content-Location` built from the alphabetized query string. A `Range` header intersects `limit`/`offset` (and is ignored for writes). With `Prefer: count`, a partial range is `206 Partial Content`, a full range stays `200`, and an offset past the last row is `416`. Without a count, reads are `200`. A negative `limit` is `416 PGRST103`; a negative offset is a no-op. `OPTIONS` answers `200` with an `Allow` header listing the methods the relation (or function) supports, and every response carries `Vary: Accept, Prefer, Range`. Writes negotiate the exposed schema with `Content-Profile` (reads use `Accept-Profile`) and echo it back when set. Errors use the PostgREST envelope:
 
 ```json
 { "code": "PGRST205", "details": null, "hint": null, "message": "Could not find the table 'nope' in the schema cache" }
@@ -502,7 +508,9 @@ Bun SQL — so a denied write surfaces as 401/403 rather than a generic 500.
 Tests run on the Node built-in test runner (`node:test`) with native TypeScript
 stripping. Unit tests for the parsers and SQL compilation need no database.
 Integration tests run against a real Postgres when `PGB_TEST_DATABASE_URL` is
-set (otherwise they are skipped):
+set (otherwise they are skipped). `test/postgrest-parity.test.ts` borrows
+behaviors from PostgREST's own spec suite (insert/update/upsert/delete, range,
+preferences, rollback) to lock in API compatibility:
 
 ```sh
 # Start a throwaway Postgres

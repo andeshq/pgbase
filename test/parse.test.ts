@@ -2,7 +2,7 @@ import { describe, test } from "node:test";
 import { expect } from "./expect.ts";
 import { parseSelect } from "../src/parse/select.ts";
 import { parseCondition, parseLogicParam } from "../src/parse/filter.ts";
-import { parseRequest } from "../src/parse/request.ts";
+import { parseMutation, parsePrefer, parseRequest } from "../src/parse/request.ts";
 
 describe("parseSelect", () => {
   test("plain columns", () => {
@@ -132,5 +132,113 @@ describe("parseRequest", () => {
     const books = parsed.embeds.get("books");
     expect(books?.limit).toBe(3);
     expect(books?.order[0]).toMatchObject({ column: "title", direction: "desc", nulls: "last" });
+  });
+
+  test("Range header is ignored for write methods", () => {
+    const request = new Request("http://localhost/books", {
+      method: "PATCH",
+      headers: { range: "0-4" },
+    });
+    const parsed = parseMutation(request, "public", "books", "PATCH");
+    expect(parsed.offset).toBeUndefined();
+    expect(parsed.limit).toBeUndefined();
+    expect(parsed.ranged).toBe(false);
+    expect(parsed.rangeLimited).toBe(false);
+  });
+
+  test("Range header intersects the limit parameter", () => {
+    const request = new Request("http://localhost/books?limit=3", { headers: { range: "0-1" } });
+    const parsed = parseRequest(request, "public", "books");
+    expect(parsed.limit).toBe(2);
+    expect(parsed.offset).toBeUndefined();
+  });
+
+  test("malformed Range headers are ignored", () => {
+    const request = new Request("http://localhost/books", { headers: { range: "abc" } });
+    const parsed = parseRequest(request, "public", "books");
+    expect(parsed.limit).toBeUndefined();
+    expect(parsed.ranged).toBe(false);
+  });
+
+  test("negative offset is a no-op, negative limit is PGRST103", () => {
+    const offset = parseRequest(
+      new Request("http://localhost/books?offset=-4"),
+      "public",
+      "books",
+    );
+    expect(offset.offset).toBeUndefined();
+
+    const limit = new Request("http://localhost/books?limit=-1");
+    let code: string | undefined;
+    try {
+      parseRequest(limit, "public", "books");
+    } catch (error) {
+      code = (error as { code: string }).code;
+    }
+    expect(code).toBe("PGRST103");
+  });
+
+  test("non-numeric limit/offset values are ignored", () => {
+    const parsed = parseRequest(new Request("http://localhost/books?limit=x&offset=y"), "public", "books");
+    expect(parsed.limit).toBeUndefined();
+    expect(parsed.offset).toBeUndefined();
+  });
+
+  test("canonical query is alphabetized and re-encoded", () => {
+    const parsed = parseRequest(
+      new Request("http://localhost/books?b=eq.1&a=eq.h%C3%A9llo&select=id"),
+      "public",
+      "books",
+    );
+    expect(parsed.canonicalQuery).toBe("a=eq.h%C3%A9llo&b=eq.1&select=id");
+  });
+
+  test("writes negotiate the profile with Content-Profile", () => {
+    const request = new Request("http://localhost/books", {
+      method: "PATCH",
+      headers: { "content-profile": "api", "accept-profile": "other" },
+    });
+    const parsed = parseMutation(request, "public", "books", "PATCH");
+    expect(parsed.profile).toBe("api");
+  });
+});
+
+describe("parsePrefer", () => {
+  test("only explicitly requested preferences are recorded", () => {
+    const prefer = parsePrefer(null);
+    expect(prefer.return).toBeNull();
+    expect(prefer.count).toBeNull();
+    expect(prefer.handling).toBeNull();
+    expect(prefer.invalid).toEqual([]);
+  });
+
+  test("first occurrence wins and unknown tokens are collected", () => {
+    const prefer = parsePrefer("return=representation, return=minimal, anything");
+    expect(prefer.return).toBe("representation");
+    expect(prefer.invalid).toEqual(["anything"]);
+  });
+
+  test("handling=strict rejects invalid preferences with PGRST122", () => {
+    let error: { code?: string; details?: string | null } | undefined;
+    try {
+      parsePrefer("handling=strict, something, else");
+    } catch (thrown) {
+      error = thrown as typeof error;
+    }
+    expect(error?.code).toBe("PGRST122");
+    expect(error?.details).toBe("Invalid preferences: something, else");
+  });
+
+  test("handling=lenient keeps invalid preferences but does not throw", () => {
+    const prefer = parsePrefer("handling=lenient, anything");
+    expect(prefer.handling).toBe("lenient");
+    expect(prefer.invalid).toEqual(["anything"]);
+  });
+
+  test("max-affected, tx, timezone and missing=null are recognized", () => {
+    const prefer = parsePrefer("max-affected=10, tx=commit, timezone=UTC, missing=null");
+    expect(prefer.maxAffected).toBe(10);
+    expect(prefer.missing).toBe("null");
+    expect(prefer.invalid).toEqual([]);
   });
 });

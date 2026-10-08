@@ -128,7 +128,7 @@ suite("hardening: tier 1 + 2", () => {
       { method: "POST", body: JSON.stringify({ n: 5 }), headers: { prefer: "count=exact" } },
       capped,
     );
-    expect(res.headers.get("content-range")).toBe(`*/${expected}`);
+    expect(res.headers.get("content-range")).toBe(`0-1/${expected}`);
   });
 
   // -- Tier 1.3: unfiltered writes -------------------------------------------

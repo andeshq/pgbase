@@ -1,5 +1,5 @@
 import { sql } from "kysely";
-import type { FilterNode, ParsedMutation, SelectNode } from "../ast.ts";
+import type { FilterNode, ParsedMutation, PreferOptions, SelectNode } from "../ast.ts";
 import { PgbaseError, DEFAULT } from "../errors.ts";
 import { buildSelectionList, resolveLevel, type ExecContext } from "./compile.ts";
 import { renderFilter, type QueryLevel } from "./filters.ts";
@@ -20,6 +20,8 @@ export interface MutationResult {
   affected: number;
   /** Whether a PUT inserted a new row (drives 201 vs 200). */
   inserted?: boolean;
+  /** Whether `Prefer: resolution` was actually applied (drives Preference-Applied). */
+  resolutionApplied?: boolean;
   /** Primary-key columns for the affected rows, used for `Location`. */
   keys?: Array<Record<string, unknown>>;
 }
@@ -29,15 +31,50 @@ type Level = QueryLevel;
 export async function executeMutation(ctx: WriteContext): Promise<MutationResult> {
   const level = resolveLevel(ctx.schema, ctx.mutation.table);
   assertWritableRelation(level, ctx.mutation.method);
-  switch (ctx.mutation.method) {
-    case "POST":
-      return executeInsert(ctx, level);
-    case "PATCH":
-      return executeUpdate(ctx, level);
-    case "PUT":
-      return executeUpsert(ctx, level);
-    case "DELETE":
-      return executeDelete(ctx, level);
+  const result = await (ctx.mutation.method === "POST"
+    ? executeInsert(ctx, level)
+    : ctx.mutation.method === "PATCH"
+      ? executeUpdate(ctx, level)
+      : ctx.mutation.method === "PUT"
+        ? executeUpsert(ctx, level)
+        : executeDelete(ctx, level));
+
+  // PostgREST applies `max-affected` to updates, deletes and RPC calls only,
+  // and a singular response must contain exactly one row. Both are checked
+  // inside the transaction so a violation rolls the write back.
+  if (ctx.mutation.singular && result.count !== 1) {
+    throw PgbaseError.notSingular(result.count ?? 0);
+  }
+  if (ctx.mutation.method === "PATCH" || ctx.mutation.method === "DELETE") {
+    assertMaxAffected(ctx.mutation.prefer, result.affected);
+  }
+  if (ctx.mutation.method === "POST") {
+    result.resolutionApplied = resolutionApplies(ctx, level);
+  }
+  return result;
+}
+
+/** `Prefer: max-affected=N` is enforced only with `handling=strict`. */
+export function assertMaxAffected(prefer: PreferOptions, affected: number): void {
+  if (prefer.maxAffected !== null && prefer.handling === "strict" && affected > prefer.maxAffected) {
+    throw PgbaseError.maxAffected(affected);
+  }
+}
+
+/** Resolution is only applied (and echoed) when a conflict target exists. */
+function resolutionApplies(ctx: WriteContext, level: Level): boolean {
+  if (ctx.mutation.prefer.resolution === null) return false;
+  const target = ctx.mutation.onConflict ?? level.relation.primaryKey;
+  return (target?.length ?? 0) > 0;
+}
+
+/** `?columns=` must name real columns, mirroring PostgREST's PGRST204. */
+function assertColumnsExist(ctx: WriteContext, level: Level): void {
+  if (!ctx.mutation.columns) return;
+  for (const column of ctx.mutation.columns) {
+    if (!level.relation.columnMap.has(column)) {
+      throw PgbaseError.columnNotFound(column, level.relation.name);
+    }
   }
 }
 
@@ -66,23 +103,32 @@ function assertWritableRelation(level: Level, method: string): void {
 
 async function readBodyRows(ctx: WriteContext): Promise<Record<string, unknown>[]> {
   const text = ctx.bodyText;
-  if (text.trim() === "") return [];
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
   } catch {
-    throw PgbaseError.parse("Failed to parse the request body as JSON");
+    // Covers an empty body too: PostgREST reports both as PGRST102.
+    throw PgbaseError.invalidBody("Empty or invalid json");
   }
   if (Array.isArray(parsed)) {
     if (!parsed.every((row) => row !== null && typeof row === "object" && !Array.isArray(row))) {
-      throw PgbaseError.parse("Every element of the JSON array body must be an object");
+      throw PgbaseError.invalidBody();
+    }
+    // PostgREST rejects bulk arrays whose objects have different keys, unless
+    // `?columns=` explicitly selects the fields.
+    if (!ctx.mutation.columns && parsed.length > 1) {
+      const canonical = Object.keys(parsed[0]!).sort().join("\u0000");
+      for (const row of parsed as Array<Record<string, unknown>>) {
+        if (Object.keys(row).sort().join("\u0000") !== canonical) throw PgbaseError.invalidBody();
+      }
     }
     return parsed as Record<string, unknown>[];
   }
   if (parsed !== null && typeof parsed === "object") {
     return [parsed as Record<string, unknown>];
   }
-  throw PgbaseError.parse("The request body must be a JSON object or an array of objects");
+  // PostgREST truncates any other JSON value to an empty array.
+  return [];
 }
 
 // ---------------------------------------------------------------------------
@@ -227,8 +273,11 @@ function affectedRows(result: any): number {
 // ---------------------------------------------------------------------------
 
 async function executeInsert(ctx: WriteContext, level: Level): Promise<MutationResult> {
+  assertColumnsExist(ctx, level);
   const bodyRows = await readBodyRows(ctx);
-  if (bodyRows.length === 0) throw PgbaseError.parse("The request body is empty");
+  // An empty JSON array inserts nothing; PostgREST still replies 201 (200 for
+  // merge-duplicates) with an empty representation.
+  if (bodyRows.length === 0) return shape(ctx, [], undefined, 0);
 
   const hasNestedBody = bodyRows.some((row) =>
     Object.entries(row).some(([key, value]) => {
@@ -250,7 +299,15 @@ async function executeInsert(ctx: WriteContext, level: Level): Promise<MutationR
   }
 
   const dropped = new Set<string>();
-  const rows = bodyRows.map((row) => renderValues(reconcileRow(ctx, level, row, dropped)));
+  const reconciled = bodyRows.map((row) => reconcileRow(ctx, level, row, dropped));
+  // `{}` means "insert a row with all defaults". Kysely renders an empty object
+  // as `() values ()`, so anchor the insert on the first column with `default`.
+  const allEmpty = reconciled.every((row) => Object.keys(row).length === 0);
+  const anchor = level.relation.columns[0]?.name;
+  const rows = (allEmpty && anchor
+    ? reconciled.map(() => ({ [anchor]: DEFAULT }))
+    : reconciled
+  ).map(renderValues);
   const pk = level.relation.primaryKey;
   const returnKeys = pk ?? level.relation.columns.map((column) => column.name);
 
@@ -261,9 +318,10 @@ async function executeInsert(ctx: WriteContext, level: Level): Promise<MutationR
   }
 
   let qb: any = ctx.db.insertInto(level.name).values(rows);
-  qb = applyConflict(ctx, qb);
+  const insertColumns = allEmpty ? [] : [...new Set(rows.flatMap((row) => Object.keys(row)))];
+  qb = applyConflict(ctx, level, qb, insertColumns);
 
-  if (!wantsRepresentation(ctx) && ctx.mutation.prefer.return === "minimal") {
+  if (!wantsRepresentation(ctx) && ctx.mutation.prefer.return !== "headers-only") {
     const result = await qb.executeTakeFirst();
     return shape(ctx, [], undefined, affectedRows(result));
   }
@@ -734,10 +792,10 @@ function pick(row: Record<string, unknown>, columns: string[]): Record<string, u
 // ---------------------------------------------------------------------------
 
 async function executeUpdate(ctx: WriteContext, level: Level): Promise<MutationResult> {
+  assertColumnsExist(ctx, level);
   const bodyRows = await readBodyRows(ctx);
-  if (bodyRows.length !== 1) {
-    throw PgbaseError.parse("PATCH requires exactly one JSON object in the body");
-  }
+  // `{}`, `[]` and `[{}]` are all no-op patches in PostgREST.
+  if (bodyRows.length === 0) return shape(ctx, [], undefined, 0);
   const dropped = new Set<string>();
   const { row: body, nested } = splitNestedBody(ctx, level, bodyRows[0]!, dropped);
   const filters = ctx.mutation.filters;
@@ -808,25 +866,35 @@ function stripKeyColumns(row: Record<string, unknown>, pk: string[] | null): Rec
 // ---------------------------------------------------------------------------
 
 async function executeUpsert(ctx: WriteContext, level: Level): Promise<MutationResult> {
+  if (ctx.mutation.rangeLimited) throw PgbaseError.putLimitNotAllowed();
+
+  // PUT filters must be exactly the primary-key columns with `eq`, and the
+  // payload must agree with them (PostgREST PGRST105/PGRST115).
+  const pk = assertPutFilters(ctx, level);
+
   const bodyRows = await readBodyRows(ctx);
-  if (bodyRows.length !== 1) {
-    throw PgbaseError.parse("PUT requires exactly one JSON object in the body");
-  }
-  const target = ctx.mutation.onConflict ?? level.relation.primaryKey;
-  if (!target || target.length === 0) {
-    throw PgbaseError.parse("PUT requires a primary key or `on_conflict` to resolve conflicts");
-  }
+  if (bodyRows.length === 0) throw PgbaseError.putMatchingPk();
+  const body = bodyRows[0]!;
+  const target = ctx.mutation.onConflict ?? pk;
 
   const dropped = new Set<string>();
-  const { row: body, nested } = splitNestedBody(ctx, level, bodyRows[0]!, dropped);
+  const { row: reconciled, nested } = splitNestedBody(ctx, level, body, dropped);
   const hasNested = nested.length > 0;
   if (hasNested) assertNestedWriteSupported(ctx, "PUT", true);
 
-  const changes = reconcileRow(ctx, level, body, dropped);
+  const changes = reconcileRow(ctx, level, reconciled, dropped);
 
   // Identity comes from the query-string filters; body values win where present.
   const identity: Record<string, unknown> = {};
   for (const eq of equalityFilters(ctx.mutation.filters)) identity[eq.column] = eq.value;
+
+  const provided: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(body)) provided[key.trim()] = value;
+  for (const column of pk) {
+    if (provided[column] !== undefined && String(provided[column]) !== String(identity[column])) {
+      throw PgbaseError.putMatchingPk();
+    }
+  }
 
   const insertRow: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(changes)) insertRow[key] = renderValues({ [key]: value })[key];
@@ -844,9 +912,7 @@ async function executeUpsert(ctx: WriteContext, level: Level): Promise<MutationR
     return Object.keys(doUpdate).length > 0 ? builder.doUpdateSet(doUpdate) : builder.doNothing();
   });
 
-  const pk = level.relation.primaryKey ?? target;
-
-  if (ctx.mutation.prefer.return === "minimal") {
+  if (!wantsRepresentation(ctx) && ctx.mutation.prefer.return !== "headers-only") {
     const result = await qb.executeTakeFirst();
     return shape(ctx, [], undefined, affectedRows(result));
   }
@@ -943,24 +1009,50 @@ async function executeDelete(ctx: WriteContext, level: Level): Promise<MutationR
 // Helpers
 // ---------------------------------------------------------------------------
 
-function applyConflict(ctx: WriteContext, qb: any): any {
+function applyConflict(ctx: WriteContext, level: Level, qb: any, insertColumns: string[]): any {
   const resolution = ctx.mutation.prefer.resolution;
   if (!resolution) return qb;
-  const target = ctx.mutation.onConflict;
+  // Without a primary key or `on_conflict` there is no conflict target, so
+  // PostgREST ignores the resolution preference entirely.
+  const target = ctx.mutation.onConflict ?? level.relation.primaryKey;
+  if (!target || target.length === 0) return qb;
   return qb.onConflict((oc: any) => {
-    const builder = target ? oc.columns(target) : oc;
-    return resolution === "ignore-duplicates" ? builder.doNothing() : builder.doUpdateSet(excludedProxy);
+    const builder = oc.columns(target);
+    if (resolution === "ignore-duplicates") return builder.doNothing();
+    // `doUpdateSet` needs concrete keys; Kysely iterates them with Object.entries.
+    const updates: Record<string, unknown> = {};
+    for (const column of insertColumns) {
+      updates[column] = sql.raw(`excluded.${quoteIdent(column)}`);
+    }
+    return Object.keys(updates).length > 0 ? builder.doUpdateSet(updates) : builder.doNothing();
   });
 }
 
-/** `doUpdateSet` needs concrete keys; proxy every column to `excluded.<col>`. */
-const excludedProxy = new Proxy(
-  {},
-  { get: (_t, prop: string) => sql.raw(`excluded.${quoteIdent(String(prop))}`) },
-) as Record<string, unknown>;
-
 function quoteIdent(value: string): string {
   return `"${value.replace(/"/g, '""')}"`;
+}
+
+/** Validate PUT's URL filters: exactly the primary-key columns with `eq`. */
+function assertPutFilters(ctx: WriteContext, level: Level): string[] {
+  const pk = level.relation.primaryKey;
+  if (!pk || pk.length === 0) throw PgbaseError.invalidFilters();
+  const filtered = new Set<string>();
+  for (const filter of ctx.mutation.filters) {
+    if (
+      filter.kind !== "op" ||
+      filter.op !== "eq" ||
+      filter.negate ||
+      (filter.jsonPath?.length ?? 0) > 0
+    ) {
+      throw PgbaseError.invalidFilters();
+    }
+    filtered.add(filter.column);
+  }
+  const pkSet = new Set(pk);
+  if (filtered.size !== pkSet.size || [...filtered].some((column) => !pkSet.has(column))) {
+    throw PgbaseError.invalidFilters();
+  }
+  return pk;
 }
 
 function equalityFilters(filters: FilterNode[]): Array<{ column: string; value: unknown }> {

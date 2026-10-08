@@ -257,7 +257,8 @@ suite("integration against Postgres", () => {
     expect(limited.status).toBe(200);
 
     const ranged = await call("/books?select=id&order=id.asc", { headers: { range: "1-2" } });
-    expect(ranged.status).toBe(206);
+    // Without `Prefer: count`, PostgREST reports 200 and a `*` total.
+    expect(ranged.status).toBe(200);
     expect(ranged.headers.get("content-range")).toBe("1-2/*");
     expect(((await ranged.json()) as any[]).map((b: any) => b.id)).toEqual([2, 3]);
 
@@ -361,7 +362,7 @@ suite("integration against Postgres", () => {
   });
 
   test("method not allowed for unsupported verbs", async () => {
-    const res = await call("/books", { method: "OPTIONS" });
+    const res = await call("/books", { method: "PROPFIND" });
     expect(res.status).toBe(405);
     expect(res.headers.get("allow")).toContain("GET");
   });

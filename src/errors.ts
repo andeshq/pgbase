@@ -42,8 +42,66 @@ export class PgbaseError extends Error {
     return new PgbaseError("PGRST100", message, 400, details);
   }
 
+  /** Invalid JSON body or a bulk array with mismatched keys. */
+  static invalidBody(message = "All object keys must match") {
+    return new PgbaseError("PGRST102", message, 400);
+  }
+
   static invalidRange(details: string) {
     return new PgbaseError("PGRST103", "Requested range not satisfiable", 416, details);
+  }
+
+  /** A requested offset lies past the last row, so no range can be served. */
+  static rangeOutOfBounds(offset: number, total: number) {
+    return new PgbaseError(
+      "PGRST103",
+      "Requested range not satisfiable",
+      416,
+      `An offset of ${offset} was requested, but there are only ${total} rows.`,
+    );
+  }
+
+  /** PUT requires the query filters to be exactly the primary-key `eq` columns. */
+  static invalidFilters() {
+    return new PgbaseError(
+      "PGRST105",
+      "Filters must include all and only primary key columns with 'eq' operators",
+      405,
+    );
+  }
+
+  static putLimitNotAllowed() {
+    return new PgbaseError(
+      "PGRST114",
+      "limit/offset querystring parameters are not allowed for PUT",
+      400,
+    );
+  }
+
+  static putMatchingPk() {
+    return new PgbaseError(
+      "PGRST115",
+      "Payload values do not match URL in primary key column(s)",
+      400,
+    );
+  }
+
+  static invalidPreferences(invalid: string[]) {
+    return new PgbaseError(
+      "PGRST122",
+      "Invalid preferences given with handling=strict",
+      400,
+      `Invalid preferences: ${invalid.join(", ")}`,
+    );
+  }
+
+  static maxAffected(count: number) {
+    return new PgbaseError(
+      "PGRST124",
+      "Query result exceeds max-affected preference constraint",
+      400,
+      `The query affects ${count} rows`,
+    );
   }
 
   static schemaNotExposed(schema: string, allowed: string) {
@@ -92,7 +150,7 @@ export class PgbaseError extends Error {
   static notSingular(count: number) {
     return new PgbaseError(
       "PGRST116",
-      "JSON object requested, multiple (or no) rows returned",
+      "Cannot coerce the result to a single JSON object",
       406,
       `The result contains ${count} rows`,
     );

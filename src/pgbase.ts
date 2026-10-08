@@ -4,18 +4,42 @@ import { parseMutation, parseRequest, parseRpc } from "./parse/request.ts";
 import { executeRead, type BaseContext } from "./query/compile.ts";
 import { executeMutation } from "./query/write.ts";
 import { executeRpc } from "./query/rpc.ts";
-import { buildResponse, buildRpcResponse, buildWriteResponse, errorResponse } from "./response.ts";
+import { buildResponse, buildRpcResponse, buildWriteResponse, errorResponse, VARY } from "./response.ts";
 import { introspect } from "./schema/index.ts";
 import { applySession } from "./session.ts";
 import { startSchemaListener, type NotifyListener } from "./schema-listener.ts";
 import { normalizeBasePath, matchBasePath, firstSchema, isWriteMethod } from "./routing.ts";
-import type { Pgbase, PgbaseConfig, PgbaseContext, PgbaseSchema, PgbaseSession } from "./types.ts";
+import type { Pgbase, PgbaseConfig, PgbaseContext, PgbaseRelation, PgbaseSchema, PgbaseSession } from "./types.ts";
 import type { WriteMethod } from "./ast.ts";
 
 function rootResponse(schema: PgbaseSchema): Response {
   return Response.json({
     schema: schema.schema,
     tables: schema.relations.map((relation) => relation.name),
+  });
+}
+
+/** `Allow` header for a relation, mirroring PostgREST's OPTIONS response. */
+function relationAllow(relation: PgbaseRelation): string {
+  const isView = relation.kind === "view";
+  const isMaterialized = relation.kind === "materialized_view";
+  const insertable = isMaterialized ? false : isView ? !!relation.insertable : true;
+  const updatable = isMaterialized ? false : isView ? !!relation.updatable : true;
+  const deletable = isMaterialized ? false : isView ? !!relation.deletable : true;
+  const hasPk = (relation.primaryKey?.length ?? 0) > 0;
+  const methods = ["OPTIONS", "GET", "HEAD"];
+  if (insertable) methods.push("POST");
+  if (insertable && updatable && hasPk) methods.push("PUT");
+  if (updatable) methods.push("PATCH");
+  if (deletable) methods.push("DELETE");
+  return methods.join(",");
+}
+
+/** Empty 200 response carrying the `Allow` header for OPTIONS requests. */
+function infoResponse(allow: string): Response {
+  return new Response(null, {
+    status: 200,
+    headers: { Allow: allow, "Content-Length": "0" },
   });
 }
 
@@ -208,7 +232,7 @@ export function createPgbase<DB = unknown>(config: PgbaseConfig<DB>): Pgbase<DB>
     return pending;
   };
 
-  const handler = async (request: Request): Promise<Response> => {
+  const handleRequest = async (request: Request): Promise<Response> => {
     const url = new URL(request.url);
     // Whether the request resolved to a non-anonymous session. Drives the
     // PostgREST 42501 mapping (403 when authenticated, 401 otherwise).
@@ -224,14 +248,19 @@ export function createPgbase<DB = unknown>(config: PgbaseConfig<DB>): Pgbase<DB>
       const schema = await loadSchema();
       const ctx: PgbaseContext = { schema, schemaName, url };
 
-      if (rest === "") return rootResponse(schema);
-
-      const profile = request.headers.get("accept-profile");
-      if (profile && profile !== "*" && profile !== schemaName) {
-        return errorResponse(PgbaseError.schemaNotExposed(profile, schemaName));
+      if (rest === "") {
+        return request.method.toUpperCase() === "OPTIONS"
+          ? infoResponse("OPTIONS,GET,HEAD")
+          : rootResponse(schema);
       }
 
       const method = request.method.toUpperCase();
+
+      const profileHeader = isWriteMethod(method) ? "content-profile" : "accept-profile";
+      const profile = request.headers.get(profileHeader);
+      if (profile && profile !== "*" && profile !== schemaName) {
+        return errorResponse(PgbaseError.schemaNotExposed(profile, schemaName));
+      }
 
       // Resolve the session once, before any transaction, so auth never holds a
       // pooled connection. Throws (e.g. invalid token) fall through to onError.
@@ -246,6 +275,8 @@ export function createPgbase<DB = unknown>(config: PgbaseConfig<DB>): Pgbase<DB>
       const table = decodeURIComponent(rest);
       if (!schema.tables.has(table)) return errorResponse(PgbaseError.tableNotFound(table));
       ctx.table = table;
+
+      if (method === "OPTIONS") return infoResponse(relationAllow(schema.tables.get(table)!));
 
       const result = isWriteMethod(method)
         ? await runWrite(runtime, request, ctx, rest, table, method as WriteMethod, session)
@@ -267,6 +298,20 @@ export function createPgbase<DB = unknown>(config: PgbaseConfig<DB>): Pgbase<DB>
       }
       return errorResponse(error, runtime.verbosity, authenticated);
     }
+  };
+
+  /**
+   * Every response gets PostgREST's default `Vary` header unless it already
+   * carries one (or the host returned an immutable response).
+   */
+  const handler = async (request: Request): Promise<Response> => {
+    const response = await handleRequest(request);
+    try {
+      if (!response.headers.has("Vary")) response.headers.set("Vary", VARY);
+    } catch {
+      // Immutable host-supplied response: leave it untouched.
+    }
+    return response;
   };
 
   return {
@@ -308,7 +353,7 @@ async function runRead(
       executeRead({ ...exec, request: parsed }),
     ),
   );
-  return { response: buildResponse(parsed, result, method), rows: result.rows.length };
+  return { response: buildResponse(parsed, result, method, runtime.basePath), rows: result.rows.length };
 }
 
 async function runWrite(
@@ -348,6 +393,26 @@ async function handleRpc(
   const fn = schema.functions.get(parsed.fn);
   if (!fn) return errorResponse(PgbaseError.functionNotFound(parsed.fn));
   parsed.readOnly = fn.volatility !== "v";
+
+  if (method === "OPTIONS") {
+    return infoResponse(fn.volatility === "v" ? "OPTIONS,POST" : "OPTIONS,GET,HEAD,POST");
+  }
+
+  // `max-affected` with handling=strict requires a set-returning function.
+  if (
+    parsed.prefer.maxAffected !== null &&
+    parsed.prefer.handling === "strict" &&
+    !fn.returnsSet &&
+    !fn.returnsTable
+  ) {
+    return errorResponse(
+      new PgbaseError(
+        "PGRST128",
+        "Function must return SETOF or TABLE when max-affected preference is used with handling=strict",
+        400,
+      ),
+    );
+  }
 
   if (method === "GET" || method === "HEAD") {
     if (!parsed.readOnly) {
@@ -397,7 +462,7 @@ async function handleRpc(
         return rows;
       }),
     );
-    return buildRpcResponse(parsed, { rows: collected, count: collected.length }, method);
+    return buildRpcResponse(parsed, { rows: collected, count: parsed.count ? collected.length : null }, method);
   }
 
   const result = await runtime.config.database.transaction().execute((trx) => invoke(trx));

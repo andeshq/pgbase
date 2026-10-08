@@ -71,18 +71,26 @@ export interface ParsedRequest {
   count: "exact" | "planned" | "estimated" | null;
   format: "json" | "csv";
   profile?: string;
-  /** True when the client sent a `Range` header. Drives 206 Partial Content. */
+  /** Canonical (sorted, re-encoded) query string, used for `Content-Location`. */
+  canonicalQuery: string;
+  /** True when a valid `Range` header was parsed (GET/HEAD only). */
   ranged: boolean;
   prefer: PreferOptions;
 }
 
 export interface PreferOptions {
-  return: "minimal" | "representation" | "headers-only";
+  /** `null` when the client did not ask for a specific representation. */
+  return: "minimal" | "representation" | "headers-only" | null;
   count: "exact" | "planned" | "estimated" | null;
   resolution: "merge-duplicates" | "ignore-duplicates" | null;
-  missing: "default" | null;
+  /** `missing=default` applies defaults; `missing=null` is the default behavior. */
+  missing: "default" | "null" | null;
   handling: "strict" | "lenient" | null;
   params: "single-object" | "bulk";
+  /** `Prefer: max-affected=N`; enforced for PATCH/DELETE/RPC with handling=strict. */
+  maxAffected: number | null;
+  /** Unrecognized preference tokens; rejected only with handling=strict. */
+  invalid: string[];
 }
 
 export type WriteMethod = "POST" | "PATCH" | "PUT" | "DELETE";
@@ -105,5 +113,7 @@ export interface ParsedMutation extends ParsedRequest {
   columns: string[] | null;
   /** Conflict target for upserts, from `?on_conflict=`. */
   onConflict: string[] | null;
+  /** True when `limit`/`offset` query params applied; PUT rejects those. */
+  rangeLimited: boolean;
 }
 

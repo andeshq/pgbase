@@ -40,6 +40,7 @@ const books = relation("books", [
   ["published", "bool"],
   ["meta", "jsonb"],
   ["tags", "_text"],
+  ["tsv", "tsvector"],
 ]);
 const tags = relation("tags", [["id", "int4"], ["name", "text"]]);
 const bookTags = relation("book_tags", [["book_id", "int4"], ["tag_id", "int4"]], []);
@@ -91,6 +92,27 @@ describe("SQL compilation", () => {
 
     const ilike = buildReadQuery(ctxFor("http://localhost/books?title=ilike.*al*")).compile();
     expect(ilike.parameters).toContain("%al%");
+  });
+
+  test("fts wraps non-tsvector columns in to_tsvector", () => {
+    const text = buildReadQuery(ctxFor("http://localhost/books?title=fts(english).cat")).compile();
+    expect(text.sql).toContain("to_tsvector");
+    expect(text.sql).toContain("@@ to_tsquery");
+    expect(text.parameters).toContain("english");
+    expect(text.parameters).toContain("cat");
+
+    const jsonb = buildReadQuery(ctxFor("http://localhost/books?meta=fts.foo")).compile();
+    expect(jsonb.sql).toContain('to_tsvector("books"."meta")');
+
+    const jsonPath = buildReadQuery(ctxFor("http://localhost/books?meta->>isbn=fts.111")).compile();
+    expect(jsonPath.sql).toContain("to_tsvector");
+    expect(jsonPath.sql).toContain("->>");
+  });
+
+  test("fts leaves a tsvector column unwrapped", () => {
+    const compiled = buildReadQuery(ctxFor("http://localhost/books?tsv=fts.cat")).compile();
+    expect(compiled.sql.includes("to_tsvector")).toBe(false);
+    expect(compiled.sql).toContain('"books"."tsv" @@ to_tsquery');
   });
 
   test("to-one embed uses jsonObjectFrom", () => {

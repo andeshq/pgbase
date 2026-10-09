@@ -359,6 +359,12 @@ to-many or nested spread requests are rejected rather than silently reshaped.
 For `like`/`ilike`, `*` is accepted as an alias for `%` in the pattern, so
 `?title=like.*Al*` does not need URL-encoding.
 
+Full-text search (`fts`, `plfts`, `phfts`, `wfts`, optionally with a language
+such as `fts(german)`) works on `tsvector` columns directly and on `text`,
+`json` and `jsonb` columns by wrapping the column in `to_tsvector`, so both
+sides of `@@` share the same text-search configuration. It works on tables and
+views alike.
+
 ### Logic
 
 ```

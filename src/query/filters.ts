@@ -113,10 +113,22 @@ function renderOpFilter(filter: OpFilter, level: QueryLevel): RawBuilder<any> {
 
   if (FTS_OPS.has(filter.op)) {
     const fn = FTS_FUNCTIONS[filter.op]!;
+    // PostgREST wraps any non-`tsvector` column in `to_tsvector` so both sides
+    // of `@@` use the same text-search configuration (and json/jsonb columns,
+    // which have no `@@ tsquery` operator, work at all). A real `tsvector`
+    // column is left as-is.
+    const column = level.relation.columnMap.get(filter.column);
+    const directTsVector =
+      column?.udt === "tsvector" && (!filter.jsonPath || filter.jsonPath.length === 0);
+    const target = directTsVector
+      ? lhs
+      : filter.tsConfig
+        ? sql`to_tsvector(${filter.tsConfig}, ${lhs})`
+        : sql`to_tsvector(${lhs})`;
     const call = filter.tsConfig
       ? sql`${sql.raw(fn)}(${filter.tsConfig}, ${filter.value})`
       : sql`${sql.raw(fn)}(${filter.value})`;
-    const expr = sql`${lhs} @@ ${call}`;
+    const expr = sql`${target} @@ ${call}`;
     return filter.negate ? sql`not (${expr})` : expr;
   }
 
